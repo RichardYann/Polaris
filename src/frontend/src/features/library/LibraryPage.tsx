@@ -230,7 +230,7 @@ function EntryRow({
 function PickHint() {
   return (
     <div className="empty" style={{ margin: 'auto' }}>
-      {tr('选择左侧论文查看详情', 'Select a paper to view details')}
+      {tr('选择论文查看详情', 'Select a paper to view details')}
     </div>
   );
 }
@@ -395,8 +395,8 @@ export function LibraryPage() {
 
   return (
     <div
-      className="page fadeup"
-      style={{ maxWidth: 1360, display: 'flex', flexDirection: 'column', height: '100%', paddingBottom: 24 }}
+      className="page fadeup page-fill"
+      style={{ maxWidth: 1360, paddingBottom: 24 }}
     >
       <PageHead eyebrow="Polaris · My Library" title={tr('我的文献库', 'My Library')} dense />
 
@@ -444,8 +444,7 @@ export function LibraryPage() {
 
       {/* —— 卡片容器（同文献追踪的论文库外壳） —— */}
       <div
-        className="card"
-        style={{ overflow: 'hidden', display: 'flex', flexDirection: 'column', flex: 1, minHeight: 480 }}
+        className="card split-card"
       >
         {tab === 'chat' ? (
           /* ======== 个人文献库对话 ======== */
