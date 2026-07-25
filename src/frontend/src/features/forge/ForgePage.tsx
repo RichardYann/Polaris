@@ -572,28 +572,42 @@ export function ForgePage() {
               ? tr('加载课题…', 'Loading topics…')
               : tr('选择一个课题', 'Pick a topic')
         }
-        right={
+      />
+
+      {/* —— 顶部一行：视图标签在左，运行入口在右 —— */}
+      <div className="row page-tabs" style={{ marginBottom: 14 }}>
+        {pid && (
+          <Segmented<ViewMode>
+            value={view}
+            onChange={setView}
+            options={[
+              { v: 'active', label: tr('想法列表', 'Ideas') },
+              { v: 'trash', label: `${tr('回收站', 'Trash')}${trashCount > 0 ? ` (${trashCount})` : ''}` },
+            ]}
+          />
+        )}
+        <div style={{ marginLeft: 'auto' }}>
           <div className="row gap8">
-            <button className="btn btn-soft" disabled={!pid || running} onClick={() => setModalOpen(true)}>
-              <Icon name="play" size={14} />
+            <button className="btn btn-soft sm" disabled={!pid || running} onClick={() => setModalOpen(true)}>
+              <Icon name="play" size={13} />
               {tr('运行 Idea Forge', 'Run Idea Forge')}
             </button>
-            <button className="btn btn-primary" disabled={!pid || running} onClick={() => openDeepDrawer()}>
+            <button className="btn btn-primary sm" disabled={!pid || running} onClick={() => openDeepDrawer()}>
               {running ? (
                 <>
-                  <Icon name="refresh" size={14} style={{ animation: 'spin 1s linear infinite' }} />
+                  <Icon name="refresh" size={13} style={{ animation: 'spin 1s linear infinite' }} />
                   {tr('运行中…', 'Running…')}
                 </>
               ) : (
                 <>
-                  <Icon name="sparkle" size={14} />
+                  <Icon name="sparkle" size={13} />
                   {tr('深度生成', 'Deep Dive')}
                 </>
               )}
             </button>
           </div>
-        }
-      />
+        </div>
+      </div>
 
       {/* 待确认研究目标提示 */}
       {deep?.pending_gate_id && (
@@ -715,14 +729,6 @@ export function ForgePage() {
           </span>
           {pid && (
             <>
-              <Segmented<ViewMode>
-                value={view}
-                onChange={setView}
-                options={[
-                  { v: 'active', label: tr('想法列表', 'Ideas') },
-                  { v: 'trash', label: `${tr('回收站', 'Trash')}${trashCount > 0 ? ` (${trashCount})` : ''}` },
-                ]}
-              />
               <button
                 className={`btn sm ${multiSelect ? 'btn-primary' : 'btn-soft'}`}
                 onClick={toggleMultiSelect}

@@ -300,7 +300,7 @@ input {
 }
 
 .content { flex: 1; overflow-y: auto; }
-.page { max-width: 1180px; margin: 0 auto; padding: 30px 36px 80px; }
+.page { max-width: 1180px; margin: 0 auto; padding: 20px 36px 80px; }
 
 /* ============================================================
    Typography & primitives
@@ -312,6 +312,10 @@ input {
 .h-title { font-size: 26px; font-weight: 680; letter-spacing: -0.02em; margin: 6px 0 0; line-height: 1.15; }
 .h-sub { font-size: 14px; color: var(--text-2); margin: 8px 0 0; max-width: 720px; line-height: 1.55; }
 .h-sub .en { color: var(--text-3); font-size: 13px; }
+/* 标签行：标签在左、操作靠右（marginLeft:auto）。窄屏允许换行，
+   否则标签组和按钮同排会把两边都挤扁。 */
+.page-tabs { flex-wrap: wrap; gap: 10px; align-items: center; }
+
 /* 页头右侧操作区（原为组件内联样式，挪到这里以便窄屏覆盖） */
 .page-head-actions { flex-shrink: 0; margin-left: 16px; }
 

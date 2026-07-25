@@ -3,6 +3,7 @@ import { Link, useNavigate } from 'react-router-dom';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Icon } from '../../components/ui/Icon';
 import { PageHead } from '../../components/ui/PageHead';
+import { Segmented } from '../../components/ui/Segmented';
 import { Modal } from '../../components/ui/Modal';
 import { FormField } from '../../components/ui/FormField';
 import { EmptyState } from '../../components/ui/EmptyState';
@@ -855,6 +856,9 @@ function ReviewDiscussion({ sessionId }: { sessionId: string }) {
 
 /* ---------------- 页面 ---------------- */
 
+/** 评审意见（总览 + 逐评审员 + 讨论） / 核对（引用核验 + 查错清单） */
+type ReviewTab = 'opinions' | 'checks';
+
 export function PaperReviewPage() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -864,6 +868,7 @@ export function PaperReviewPage() {
   const [msId, setMsId] = useState<string | null>(null);
   const [roundSid, setRoundSid] = useState<string | null>(null);
   const [modalOpen, setModalOpen] = useState(false);
+  const [tab, setTab] = useState<ReviewTab>('opinions');
 
   // —— 稿件列表（只保留可评审状态：已编译 / 评审中） ——
   const manuscriptsQuery = useQuery({
@@ -1006,14 +1011,26 @@ export function PaperReviewPage() {
         title={tr('论文评审', 'Paper Review')}
         sub={
           currentProject
-            ? `${tr('当前课题', 'Current topic')}：${currentProject.name}`
+            ? undefined
             : projectsLoading
               ? tr('加载课题…', 'Loading topics…')
               : tr('选择一个课题', 'Pick a topic')
         }
-        right={
+      />
+
+      {/* —— 顶部一行：两个视图标签在左，发起评审在右 —— */}
+      <div className="row page-tabs" style={{ marginBottom: 14 }}>
+        <Segmented<ReviewTab>
+          options={[
+            { v: 'opinions', label: tr('评审意见', 'Opinions') },
+            { v: 'checks', label: tr('核对', 'Checks') },
+          ]}
+          value={tab}
+          onChange={setTab}
+        />
+        <div style={{ marginLeft: 'auto' }}>
           <button
-            className="btn btn-primary"
+            className="btn btn-primary sm"
             disabled={!msId || !!runningReview}
             title={
               !msId
@@ -1026,18 +1043,18 @@ export function PaperReviewPage() {
           >
             {runningReview ? (
               <>
-                <Icon name="refresh" size={14} style={{ animation: 'spin 1s linear infinite' }} />
+                <Icon name="refresh" size={13} style={{ animation: 'spin 1s linear infinite' }} />
                 {tr('评审中…', 'Reviewing…')}
               </>
             ) : (
               <>
-                <Icon name="shield" size={14} />
+                <Icon name="shield" size={13} />
                 {tr('发起同行评审', 'Start peer review')}
               </>
             )}
           </button>
-        }
-      />
+        </div>
+      </div>
 
       {/* —— 稿件 + 评审轮次选择 —— */}
       <div className="card card-pad row gap10" style={{ marginBottom: 16, flexWrap: 'wrap' }}>
@@ -1191,6 +1208,8 @@ export function PaperReviewPage() {
         </div>
       ) : (
         <>
+          {tab === 'opinions' && (
+          <>
           {/* 总览 */}
           <MetaOverviewCard
             meta={meta}
@@ -1242,14 +1261,20 @@ export function PaperReviewPage() {
             )}
           </div>
 
-          {/* 引用核验 */}
-          <CitationCard check={citation} />
-
-          {/* 查错清单 */}
-          <FactCheckCard items={factItems} msId={msId} files={detail?.files} />
-
           {/* 人类讨论 */}
           {sid && <ReviewDiscussion sessionId={sid} />}
+          </>
+          )}
+
+          {tab === 'checks' && (
+          <>
+            {/* 引用核验 */}
+            <CitationCard check={citation} />
+
+            {/* 查错清单 */}
+            <FactCheckCard items={factItems} msId={msId} files={detail?.files} />
+          </>
+          )}
 
           {/* 底部操作 */}
           <div className="card card-pad row gap10" style={{ justifyContent: 'space-between', flexWrap: 'wrap' }}>
