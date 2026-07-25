@@ -104,8 +104,34 @@ input {
 }
 
 /* —— 收起态：图标轨道（只留图标，隐藏文字） ——
-   图标列中心恒为侧栏中线（66/2 = 33px），与展开态一致，收放不跳动。 */
+   图标列中心恒为**内容盒**中线（66/2 = 33px），与展开态一致，收放不跳动。 */
 .nav-collapsed .sidebar { width: 66px; }
+
+/* —— 桌面端（macOS）收起态轨道 ——
+   要容得下交通灯：灯组在窗口坐标里占 x=18..70pt（window.ts 把 trafficLightPosition
+   钉在 x:18，三个 12pt 按钮、20pt 中心间距），而 66px 经 html{zoom:1.1} 渲染成
+   72.6pt，右侧只剩 2.6pt，灯几乎贴着分隔线。80px = 88pt，灯组左右各留 18pt。
+
+   轨道变宽后，内容的中线从 33px 移到 40px。为了让「收放不位移」这条不变量继续成立，
+   展开态的锚点也整体右移 7px——两态共用 40px 这条中线。位移只挂在 :not(.nav-collapsed)
+   上，否则会串味到收起态、把居中的内容再推右一次。 */
+:root[data-desktop-platform='darwin'] .nav-collapsed .sidebar { width: 80px; }
+:root[data-desktop-platform='darwin'] .app:not(.nav-collapsed) .sb-brand { margin-left: 19.5px; }
+:root[data-desktop-platform='darwin'] .app:not(.nav-collapsed) .sb-scroll { padding-left: 19px; }
+:root[data-desktop-platform='darwin'] .app:not(.nav-collapsed) .sb-nav-static { padding-left: 19px; }
+
+/* 图形标两态同尺寸、同坐标——**不要**在收起态放大它。尺寸一变，包围盒的四条边
+   就都动了，看起来就是「位置在跳」。
+
+   坐标是天然吻合的，不是凑出来的：图形标 41px，展开态 margin-left: 19.5px
+   → 中心 19.5 + 20.5 = 40px；收起态在 80px 轨道里居中 → 左边缘 (80-41)/2
+   = 19.5px → 中心同样 40px。同一个 19.5，两态自动重合。
+
+   item 图标放大到 21px（原 18px）。.nav-ic 的**宽度必须保持 24px**——它定义了
+   图标列的横向锚点（展开 19+9+12 = 40px，收起居中 = 40px），动了宽度就破锚。
+   高度补到 22px 容纳放大后的图形，两态一致所以不会在收放时跳。 */
+:root[data-desktop-platform='darwin'] .nav-ic { height: 22px; }
+:root[data-desktop-platform='darwin'] .nav-ic svg { width: 21px; height: 21px; }
 /* 收起态：图形标居中（字标由 React 直接不渲染，尺寸与展开态一致，不缩放） */
 .nav-collapsed .sb-brand { justify-content: center; margin: 14px 0 8px; } /* 垂直边距必须与展开态一致，否则收放跳位 */
 .nav-collapsed .sb-scroll { padding: 0 8px 14px; }
@@ -997,6 +1023,23 @@ input[type="range"] { accent-color: var(--accent); cursor: pointer; }
   padding: 0 18px; border-bottom: 0.5px solid var(--border);
   background: var(--surface); box-shadow: var(--shadow-card);
 }
+/* 桌面端（macOS）：阅览模式是覆盖整个窗口的浮层，顶栏贴在 y=0，交通灯会压住
+   最左侧的「退出阅览」按钮，点不到。把留白加在顶栏自身而不是外层容器上——
+   打印时顶栏 display:none，这条留白也跟着消失，不会在导出的 PDF 顶部留白条。
+   height 用 calc 补偿：全局 box-sizing 是 border-box，只加 padding 会压缩内容高度。 */
+:root[data-desktop-platform='darwin'] .paper-reader-topbar {
+  position: relative;
+  height: calc(52px + var(--titlebar-h));
+  padding-top: var(--titlebar-h);
+}
+/* 留白本身可拖窗口（内容盖住了系统标题栏区域） */
+:root[data-desktop-platform='darwin'] .paper-reader-topbar::before {
+  content: '';
+  position: absolute; top: 0; left: 0; right: 0;
+  height: var(--titlebar-h);
+  -webkit-app-region: drag;
+}
+
 .paper-reader-topbar-title {
   flex: 1; min-width: 0; text-align: center; font-size: 12.5px; font-weight: 600; color: var(--text-2);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
