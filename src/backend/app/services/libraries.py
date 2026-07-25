@@ -248,10 +248,17 @@ def dedupe_member_rows(
 
 
 def user_visible_paper_stmt(user_id: uuid.UUID) -> Select:
-    """用户可管理论文（其所属方向的库 ∪ 被任命管理的库 ∪ 平台 admin 全库）
-    的成员行：SELECT (Paper, LibraryPaper, project_id)。P6 起策展人/管理员与
-    成员同权（docs-dev/workspace-ia-redesign.md §5）。"""
+    """用户可见论文（其课题关联的库 ∪ 被任命策展的库 ∪ 平台 admin 全库）的
+    成员行：SELECT (Paper, LibraryPaper, project_id)。
+
+    「我课题的库」走关联表 ``topic_source_libraries`` —— 课题与库是多对多关联，
+    不是 project_id 回指。按 project_id 判会漏掉课题关联的独立库（那才是常态：
+    P9c 起建课题不再自动建库），也会算进已经不再关联的历史起源库。
+    """
     my_projects = select(ProjectMember.project_id).where(ProjectMember.user_id == user_id)
+    my_topic_libraries = select(TopicSourceLibrary.library_id).where(
+        TopicSourceLibrary.topic_id.in_(my_projects)
+    )
     my_curated = select(DirectionLibraryCurator.library_id).where(
         DirectionLibraryCurator.user_id == user_id
     )
@@ -262,7 +269,7 @@ def user_visible_paper_stmt(user_id: uuid.UUID) -> Select:
         .join(DirectionLibrary, DirectionLibrary.id == LibraryPaper.library_id)
         .where(
             or_(
-                DirectionLibrary.project_id.in_(my_projects),
+                DirectionLibrary.id.in_(my_topic_libraries),
                 DirectionLibrary.id.in_(my_curated),
                 is_admin,
             )
@@ -838,17 +845,17 @@ async def _is_project_member(
 async def can_manage_library(
     session: AsyncSession, *, user: User, library: DirectionLibrary
 ) -> bool:
-    """库级写权限（P10）：平台 admin ∪ 创建者（submitted_by）∪ 策展人 ∪ 背后课题成员。
+    """库级写权限：平台 admin ∪ 创建者（submitted_by）∪ 策展人。
 
     公共库全体 admin 都能管；个人库只创建者 + admin（策展人默认含创建者本人，仍适用）。
+
+    起源课题的成员**不再**因这层关系拿到管理权：库与课题解耦后 project_id 只是
+    「这个库当初从哪个课题建的」的历史指针，不是归属。此前靠这条在管库的人，由
+    迁移 b3d81f6c05a9 补成策展人保住权限。
     """
     if user.role == "admin":
         return True
     if library.submitted_by is not None and library.submitted_by == user.id:
-        return True
-    if library.project_id is not None and await _is_project_member(
-        session, project_id=library.project_id, user_id=user.id
-    ):
         return True
     return await is_library_curator(session, library_id=library.id, user_id=user.id)
 
