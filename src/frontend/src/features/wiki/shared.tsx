@@ -1,10 +1,12 @@
-import { useEffect, useId, useState, type ReactNode } from 'react';
+import { useCallback, useEffect, useId, useState, type ReactNode } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { api, type ConceptCategory, type PaperAuthor, type ReadingStatus } from '../../lib/api';
 import { tr } from '../../lib/i18n';
 import { clickable } from '../../lib/a11y';
 import { Icon } from '../../components/ui/Icon';
 import { Switch } from '../../components/ui/Switch';
+import { toast } from '../../components/ui/Toast';
 import { READING_STATUS } from '../reading/shared';
 
 /* ============================================================
@@ -32,6 +34,71 @@ export const CONCEPT_CATEGORY: Record<ConceptCategory, CategoryMeta> = {
 
 export function categoryMeta(cat: string): CategoryMeta {
   return CONCEPT_CATEGORY[cat as ConceptCategory] ?? CONCEPT_CATEGORY.other;
+}
+
+/** 概念名归一化：小写 + 非字母数字折叠成 '-'（与后端 slug 同口径），
+    吃掉「self attention / self-attention」这类写法差异。 */
+function normalizeConceptName(name: string): string {
+  return name
+    .trim()
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+/**
+ * `[[双链]]` 解析结果里挑哪一条：名字精确匹配（忽略大小写）优先，再退一步比归一化名
+ * （空格/连接符写法差异）。都不中就是「还没入库」——绝不拿子串结果凑数，
+ * 否则 `[[attention]]` 会跳去「flash attention」。
+ */
+export function pickConceptByName<T extends { name: string }>(list: T[], name: string): T | null {
+  const needle = name.trim().toLowerCase();
+  const exact = list.find((c) => c.name.trim().toLowerCase() === needle);
+  if (exact) return exact;
+  const slug = normalizeConceptName(name);
+  return list.find((c) => normalizeConceptName(c.name) === slug) ?? null;
+}
+
+/**
+ * 概念页路径：`/concepts/<id>`。
+ * - 带 libraryId（从某个库的上下文点进来）→ 关联论文只列这个库里的；
+ * - 不带（每日推送、个人库、相关研究这类池级上下文）→ 关联论文列全平台的。
+ * 词条本身全平台一份，所以概念不属于任何库时照样能打开。
+ */
+export function conceptPath(conceptId: string, libraryId?: string | null): string {
+  return `/concepts/${conceptId}${libraryId ? `?library=${encodeURIComponent(libraryId)}` : ''}`;
+}
+
+/**
+ * 池级上下文（阅读页 / 每日推送 / 我的文献库 / 相关研究）里点概念的统一处理：
+ * 一律进不限库的概念页，关联论文列全平台的。
+ * - chip 自带 id，直接跳；
+ * - `[[双链]]` 只有名字，走平台级按名查（概念全平台唯一，命中至多一条），
+ *   没入库就提示一句，不再退回某个库的视角。
+ * 库内的入口不用这个 hook：那里要的是库视角，带 library id 就地展示。
+ */
+export function usePoolConceptNav() {
+  const navigate = useNavigate();
+  const openConcept = useCallback(
+    (concept: { id: string }) => navigate(conceptPath(concept.id)),
+    [navigate],
+  );
+  const openConceptByName = useCallback(
+    async (name: string) => {
+      try {
+        const hit = pickConceptByName(await api.lookupConcept(name), name);
+        if (!hit) {
+          toast(tr(`概念「${name}」还没入库`, `“${name}” is not in the knowledge base yet`), 'info');
+          return;
+        }
+        navigate(conceptPath(hit.id));
+      } catch {
+        toast(tr('概念解析失败（后端不可用）', 'Concept lookup failed (backend unavailable)'), 'error');
+      }
+    },
+    [navigate],
+  );
+  return { openConcept, openConceptByName };
 }
 
 /** 详情页小节标题（左侧 accent 竖条）。 */

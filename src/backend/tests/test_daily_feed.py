@@ -318,8 +318,8 @@ async def test_collect_to_library_topic_personal(client, monkeypatch):
     assert resp.json()["results"][0]["forbidden"] is True
 
 
-async def test_compile_entry_and_collect_copies_wiki(client, monkeypatch):
-    """单篇解读编译（fake LLM）落 entry；收录时拷进方向库成员行 / 书架快照 / 个人库条目。"""
+async def test_compile_entry_and_collect(client, monkeypatch):
+    """单篇解读编译（fake LLM）落 paper_wikis；收录进方向库 / 书架 / 个人库后照样读得到。"""
     token = await register_and_login(client)
     headers = {"Authorization": f"Bearer {token}"}
     project_id, library_id = await make_project_with_library(client, headers, name="wiki-proj")
@@ -359,11 +359,80 @@ async def test_compile_entry_and_collect_copies_wiki(client, monkeypatch):
         membership = (
             await session.execute(select(LibraryPaper).where(LibraryPaper.library_id == library_id))
         ).scalar_one()
-        assert membership.wiki_content and membership.compiled_at is not None
+        assert membership.status == "included"
         shelf_row = (await session.execute(select(TopicPaper))).scalar_one()
-        assert shelf_row.wiki_snapshot
+        assert shelf_row.paper_id == uuid.UUID(paper_id)
         personal = (await session.execute(select(UserLibraryEntry))).scalar_one()
-        assert personal.wiki_content
+        assert personal.saved is True
+
+    # 解读只有一份：库 / 书架 / 个人库三条路径读到的都是它
+    resp = await client.get(f"/api/papers/{paper_id}", headers=headers)
+    wiki = resp.json()["wiki_content"]
+    assert wiki and wiki.strip()
+    resp = await client.get(f"/api/projects/{project_id}/shelf", headers=headers)
+    assert resp.json()["items"][0]["wiki_content"] == wiki
+    entry_resp = await client.get("/api/me/library?tab=saved", headers=headers)
+    lib_entry_id = entry_resp.json()["items"][0]["id"]
+    resp = await client.get(f"/api/me/library/{lib_entry_id}", headers=headers)
+    assert resp.json()["wiki_content"] == wiki
+
+
+async def test_compile_entry_links_concepts_without_library(client, monkeypatch):
+    """每日推送编译也要上链概念：论文不属于任何库照建词条，费用记平台级（library_id 空）。
+
+    再编译一次能把被清掉的关联补回来——存量论文重新编译即可，不用迁移。"""
+    token = await register_and_login(client, email="daily-concepts@example.com")
+    headers = {"Authorization": f"Bearer {token}"}
+    await _run_sync(monkeypatch, {"cs.AI": [_rss_entry("2607.00061", "Concept Me")]})
+    item = (await client.get("/api/daily/papers", headers=headers)).json()["items"][0]
+
+    resp = await client.post(f"/api/daily/papers/{item['entry_id']}/compile", headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert "[[" in resp.json()["wiki_content"]  # 正文里有双链
+
+    from sqlalchemy import delete, select
+
+    from app.core.db import get_sessionmaker
+    from app.models.library_direction import LibraryPaper
+    from app.models.llm_config import LLMUsage
+    from app.models.paper import Concept, paper_concepts
+
+    paper_id = uuid.UUID(item["paper_id"])
+
+    async def _linked_concepts() -> list[Concept]:
+        async with get_sessionmaker()() as session:
+            return list(
+                (
+                    await session.execute(
+                        select(Concept)
+                        .join(paper_concepts, paper_concepts.c.concept_id == Concept.id)
+                        .where(paper_concepts.c.paper_id == paper_id)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
+    concepts = await _linked_concepts()
+    assert {c.name for c in concepts} == {"Agent", "强化学习"}  # fake librarian 的双链
+    assert all(not c.definition.endswith("（定义待补充）") for c in concepts)  # 定义真的要到了
+
+    async with get_sessionmaker()() as session:
+        # 这篇论文不属于任何库，上链照样发生
+        assert (await session.execute(select(LibraryPaper))).scalars().all() == []
+        rows = (await session.execute(select(LLMUsage))).scalars().all()
+        assert rows and all(r.library_id is None for r in rows)  # 记账落平台级，不摊给某个库
+        assert any(r.stage == "extract" for r in rows)  # 概念定义那次调用记在触发人名下
+        assert all(r.user_id is not None for r in rows)
+
+        # 存量（编译过但没上链）的路径：清掉关联后重新编译能补回来
+        await session.execute(delete(paper_concepts).where(paper_concepts.c.paper_id == paper_id))
+        await session.commit()
+    assert await _linked_concepts() == []
+
+    resp = await client.post(f"/api/daily/papers/{item['entry_id']}/compile", headers=headers)
+    assert resp.status_code == 200, resp.text
+    assert {c.name for c in await _linked_concepts()} == {"Agent", "强化学习"}
 
 
 async def test_daily_pool_chat_sse(client, monkeypatch):

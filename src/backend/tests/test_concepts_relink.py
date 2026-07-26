@@ -5,10 +5,17 @@ import uuid
 from sqlalchemy import insert, select
 
 from app.core.db import get_sessionmaker
-from app.models.paper import Paper, paper_concepts
+from app.models.paper import Paper, PaperWiki, paper_concepts
 from app.services.concepts import link_paper_concepts, placeholder_definition
 
-from .conftest import add_concept, add_paper, membership_of, project_concepts, register_and_login
+from .conftest import (
+    add_concept,
+    add_paper,
+    membership_of,
+    project_concepts,
+    register_and_login,
+    wiki_of,
+)
 
 
 async def _setup(client):
@@ -111,12 +118,19 @@ async def test_relink_backfills_placeholder_definitions(client):
 
 
 async def _set_wiki_content(project_id: str, title: str, content) -> uuid.UUID:
+    """改写这篇论文的解读正文（论文级唯一一份；content=None 表示删掉解读）。"""
     async with get_sessionmaker()() as session:
         paper = (
             await session.execute(select(Paper).where(Paper.title == title))
         ).scalar_one()
-        membership = await membership_of(session, project_id=project_id, paper_id=paper.id)
-        membership.wiki_content = content
+        wiki = await wiki_of(session, paper_id=paper.id)
+        if content is None:
+            if wiki is not None:
+                await session.delete(wiki)
+        elif wiki is None:
+            session.add(PaperWiki(paper_id=paper.id, content=content))
+        else:
+            wiki.content = content
         await session.commit()
         return paper.id
 
@@ -213,6 +227,40 @@ async def test_link_paper_concepts_empty_content_keeps_links(client):
 
     counts = await _concept_counts(client, project_id, headers)
     assert counts == {"自我博弈": 1, "强化学习": 2, "课程学习": 1}
+
+
+async def test_link_paper_concepts_without_membership(client):
+    """池内论文（不属于任何库）也能上链：不传成员行 → 记账落平台级，不报错。"""
+    from app.core.llm.router import LLMRouter
+    from app.models.llm_config import LLMUsage
+    from app.models.paper import Concept, new_paper
+
+    await register_and_login(client, email="pool-link@example.com")
+    async with get_sessionmaker()() as session:
+        paper = new_paper(title="Pool Paper", abstract="a", source="manual")
+        session.add(paper)
+        await session.flush()
+        paper.wiki = PaperWiki(content="本文用 [[池内概念]] 做实验。")
+        await session.commit()
+        created, linked = await link_paper_concepts(session, paper, llm=LLMRouter())
+        paper_id = paper.id
+    assert (created, linked) == (1, 1)
+
+    async with get_sessionmaker()() as session:
+        names = (
+            (
+                await session.execute(
+                    select(Concept.name)
+                    .join(paper_concepts, paper_concepts.c.concept_id == Concept.id)
+                    .where(paper_concepts.c.paper_id == paper_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert names == ["池内概念"]
+        usage = (await session.execute(select(LLMUsage))).scalars().all()
+        assert usage and all(row.library_id is None for row in usage)
 
 
 async def test_relink_requires_membership(client):
