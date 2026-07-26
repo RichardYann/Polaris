@@ -22,6 +22,17 @@ html { zoom: 1.1; }
 :root { --titlebar-h: 0px; }
 :root[data-desktop-platform='darwin'] { --titlebar-h: 36.4px; }
 
+/* Windows 的窗口控件是横排在右上角的，做法与 macOS 相反：不下移内容，而是在
+   顶栏右端留出按钮宽度，让它们排在铃铛右边、同一行。
+   宽度取自 Chromium 暴露的 env(titlebar-area-*)——titlebar-area-width 是**不含**
+   按钮区的可用宽度，用视口宽减去它就是按钮区宽度，能跟随 DPI 缩放。
+   再除以 1.1：env()/vw 给的是未经 zoom 的 CSS px，而这里的 padding 会被
+   html{zoom:1.1} 放大（与 --titlebar-h 同理）。 */
+:root { --winctl-w: 0px; }
+:root[data-desktop-platform='win32'] {
+  --winctl-w: calc((100vw - env(titlebar-area-width, calc(100vw - 138px))) / 1.1);
+}
+
 /* 让空出来的带子可以拖动窗口（内容盖住了系统标题栏区域，否则拖不动）。
    只覆盖留白本身，不会挡住任何可点元素。 */
 :root[data-desktop-platform='darwin'] .sidebar::before,
@@ -41,8 +52,17 @@ html { zoom: 1.1; }
    还要 align-self: stretch：.topbar 是 align-items:center，而 .spacer 是个空 div，
    默认高度为 0——拖拽区是条零高度的矩形，等于没有。撑满行高才真的抓得住。
    .spacer 本来就没有内容，撑开不可见；.crumb 自身是 flex 居中，撑开后文字不动。 */
-:root[data-desktop-platform='darwin'] .topbar > .crumb,
-:root[data-desktop-platform='darwin'] .topbar > .spacer {
+:root[data-desktop-platform='win32'] .topbar { padding-right: calc(22px + var(--winctl-w)); }
+/* 阅览浮层的顶栏同样贴着窗口右缘，「导出 PDF」会被按钮压住（原 padding: 0 18px） */
+:root[data-desktop-platform='win32'] .paper-reader-topbar {
+  padding-right: calc(18px + var(--winctl-w));
+}
+/* 登录/配置页右上角的语言切换同理 */
+:root[data-desktop-platform='win32'] .auth-lang { right: calc(20px + var(--winctl-w)); }
+
+/* 拖拽区两平台共用：顶栏没有系统标题栏可抓，得自己声明 */
+:root[data-desktop-titlebar='overlay'] .topbar > .crumb,
+:root[data-desktop-titlebar='overlay'] .topbar > .spacer {
   -webkit-app-region: drag;
   align-self: stretch;
 }
@@ -770,6 +790,7 @@ input[type="range"] { accent-color: var(--accent); cursor: pointer; }
     radial-gradient(120% 130% at 20% 0%, #f2f5fa 0%, #e3eaf4 45%, #d3deef 100%);
   padding: 24px clamp(24px, 9vw, 150px) 24px 24px;
 }
+.auth-lang { position: absolute; top: 18px; right: 20px; }
 .auth-brand {
   position: absolute; top: calc(26px + var(--titlebar-h)); left: 30px;
   display: flex; align-items: center; gap: 14px;
