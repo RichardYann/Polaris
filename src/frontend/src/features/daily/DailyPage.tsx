@@ -416,6 +416,9 @@ function DailyDetailPane({
         <PaperMyTagsRow paperId={poolPaper.id} myTags={poolPaper.my_tags} detailKey={poolKey} />
       )}
 
+      {/* —— 概念 chips（与库版同款；点了进不限库的概念页） —— */}
+      <ConceptChips concepts={paper.concepts} onOpen={openConcept} />
+
       {/* —— frontmatter 风格元信息（默认折叠）；编译时间在下方 AI 图文介绍那行已有 —— */}
       <MetaFold>
         <MetaItem label="arxiv_id">
@@ -434,14 +437,10 @@ function DailyDetailPane({
       </MetaFold>
 
       {/* 摘要默认折叠，复用元信息那套折叠块的样式，两者视觉一致 */}
-      {paper.abstract ? (
+      {paper.abstract && (
         <MetaFold label={tr('摘要', 'Abstract')}>
           <p style={{ fontSize: 13.5, lineHeight: 1.7, margin: 0 }}>{paper.abstract}</p>
         </MetaFold>
-      ) : (
-        <div className="empty" style={{ padding: 20, marginTop: 18 }}>
-          {tr('这篇还没有摘要。', 'No abstract for this paper.')}
-        </div>
       )}
 
       {/* —— TL;DR（来自内容池详情） —— */}
@@ -463,9 +462,6 @@ function DailyDetailPane({
           {poolPaper.tldr}
         </div>
       )}
-
-      {/* —— 概念 chips（与库版同款；点了进不限库的概念页） —— */}
-      <ConceptChips concepts={paper.concepts} onOpen={openConcept} />
 
       {/* —— 我的笔记（只有自己看得到） —— */}
       {poolPaper && (
@@ -612,6 +608,8 @@ export function DailyPage() {
   const [page, setPage] = useState(1);
   // —— 日期（null=全部，默认就停在全部）留在工具栏；分类 / 类型收进高级检索面板 ——
   const [day, setDay] = useState<string | null>(null);
+  // 只看被某个文献库收录的论文（#218）。空 = 不限
+  const [libraryId, setLibraryId] = useState('');
   // 高级检索默认展开：分类 / 类型是常用筛选，藏起来用户找不到
   const [advOpen, setAdvOpen] = useState(true);
   const [category, setCategory] = useState('');
@@ -622,7 +620,8 @@ export function DailyPage() {
   const author = useDebounced(authorInput.trim());
   const affiliation = useDebounced(affiliationInput.trim());
   // 高级条件是否偏离默认（决定高级检索按钮上的小圆点）
-  const advActive = !!category || announce !== DEFAULT_ANNOUNCE || !!author || !!affiliation;
+  const advActive =
+    !!category || announce !== DEFAULT_ANNOUNCE || !!author || !!affiliation || !!libraryId;
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [collectPaper, setCollectPaper] = useState<CollectPaperRef | null>(null);
   const [collectOpen, setCollectOpen] = useState(false);
@@ -688,6 +687,7 @@ export function DailyPage() {
       setAuthorInput(patch.author ?? '');
       setAffiliationInput(patch.affiliation ?? '');
       setCategory('');
+      setLibraryId('');
       setAnnounce('all');
       setAdvOpen(true);
       pickDay(null);
@@ -711,11 +711,21 @@ export function DailyPage() {
     retry: false,
     staleTime: 300_000,
   });
+  // 按库筛选的候选：后端只回请求者看得见的库，这里照单全收
+  const librariesQuery = useQuery({
+    queryKey: ['libraries-for-daily-filter'],
+    queryFn: () => api.listLibraries(),
+    retry: false,
+    staleTime: 300_000,
+  });
 
   // 语义检索：只在有关键词时生效；结果按相关度排序、不分页
   const semantic = !!q && semanticOn;
   const listQuery = useQuery({
-    queryKey: ['daily-papers', semanticOn, page, q, day, category, announce, author, affiliation],
+    queryKey: [
+      'daily-papers',
+      semanticOn, page, q, day, category, announce, author, affiliation, libraryId,
+    ],
     queryFn: () =>
       api.listDailyPapers({
         sort: semantic ? undefined : DAILY_SORT,
@@ -727,6 +737,7 @@ export function DailyPage() {
         announce: announce === 'all' ? undefined : announce,
         author: author || undefined,
         affiliation: affiliation || undefined,
+        libraryId: libraryId || undefined,
         mode: semantic ? 'semantic' : undefined,
       }),
     retry: false,
@@ -897,6 +908,7 @@ export function DailyPage() {
                     advActive
                       ? () => {
                           setCategory('');
+                          setLibraryId('');
                           setAnnounce(DEFAULT_ANNOUNCE);
                           setAuthorInput('');
                           setAffiliationInput('');
@@ -904,6 +916,25 @@ export function DailyPage() {
                       : undefined
                   }
                 >
+                  <div className="row gap6" style={{ alignItems: 'center' }}>
+                    <span style={{ width: 34, flexShrink: 0, fontSize: 11, color: 'var(--text-3)' }}>
+                      {tr('文献库', 'Library')}
+                    </span>
+                    <select
+                      className="input"
+                      style={{ flex: 1, minWidth: 0, height: 26, fontSize: 11, padding: '0 6px' }}
+                      value={libraryId}
+                      onChange={(e) => setLibraryId(e.target.value)}
+                      title={tr('只看被某个文献库收录的论文', 'Only papers collected by one library')}
+                    >
+                      <option value="">{tr('全部文献库', 'All libraries')}</option>
+                      {(librariesQuery.data ?? []).map((lib) => (
+                        <option key={lib.id} value={lib.id}>
+                          {lib.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
                   <div className="row gap6" style={{ alignItems: 'center' }}>
                     <span style={{ width: 34, flexShrink: 0, fontSize: 11, color: 'var(--text-3)' }}>
                       {tr('分类', 'Category')}
