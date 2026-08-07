@@ -495,13 +495,23 @@ export function AssistantPanel({
   const scrollRef = useRef<HTMLDivElement>(null);
   const location = useLocation();
   // 对话里的「项目」就是平台里的课题。**默认不选**：选了之后检索范围就收窄到这个
-  // 课题，而用户多数问题是跨课题的；想收窄时自己挑一个，比默认收窄再去发现「怎么
-  // 查不到别的库」要好。
+  // 课题。**默认跟随你正在做的那个课题**：人问「实验跑得怎么样」时，指的多半就是
+  // 眼前这个课题的实验，而不是全实验室的。想问别的课题、或者想放开到全部资产，
+  // 点上面那个按钮改——改了就以你改的为准，不再被界面切换带着走。
   //
-  // 以前这里是个开关，只能绑「你现在正在看的那个课题」——想问另一个课题，得先把整个
-  // 界面切过去。现在存的是选中的课题 id，输入框上方那个按钮直接挑。
-  const { projects } = useProject();
-  const [topicId, setTopicId] = useState<string | null>(null);
+  // 以前这里是个开关，只能绑当前课题、不能挑；再往前默认是「全部」，于是问一句
+  // 「我的实验」会把别的课题的也捞进来。
+  const { projects, currentProjectId } = useProject();
+  const [topicId, setTopicId] = useState<string | null>(currentProjectId);
+  // 用户自己动过选择之后，就别再跟着界面切课题——那是他的选择，不是界面的。
+  const topicPinned = useRef(false);
+  useEffect(() => {
+    if (!topicPinned.current) setTopicId(currentProjectId);
+  }, [currentProjectId]);
+  const pickTopic = useCallback((id: string | null) => {
+    topicPinned.current = true;
+    setTopicId(id);
+  }, []);
   const [topicOpen, setTopicOpen] = useState(false);
   const [topicQuery, setTopicQuery] = useState('');
   const topic = useMemo(
@@ -581,7 +591,9 @@ export function AssistantPanel({
         setHistoryOpen(false);
         // 会话上存着的课题才是这场对话真正的作用域，跟着切过去。
         // （这句注释以前是空头支票：写着「跟着切」，却没有一行代码在切。）
-        setTopicId(conversations.find((c) => c.id === id)?.project_id ?? null);
+        // 会话自己的作用域也算「定下来了」：它是这场对话当初问的范围，
+        // 不该被用户后来在界面上切课题给盖掉。
+        pickTopic(conversations.find((c) => c.id === id)?.project_id ?? null);
         setTurns(
           messages
             // 一轮会落成几条消息：assistant（正文/调用）+ 携带工具结果的那条。
@@ -603,7 +615,7 @@ export function AssistantPanel({
         /* 载入失败保持现状 */
       }
     },
-    [conversations],
+    [conversations, pickTopic],
   );
 
   const newConversation = useCallback(() => {
@@ -998,7 +1010,12 @@ export function AssistantPanel({
           </button>
 
           {/* 课题选择：和加号并排。以前这里是一行说明文字，只告诉你现在查的是什么，
-              要换得去别处切；现在它自己就是入口——点开挑一个，再点「全部文献库」放开。 */}
+              要换得去别处切；现在它自己就是入口——点开挑一个，再点「所有资产」放开。
+
+              这里选的是**这次问话够得着哪些资产**：选了课题，就只看这个课题名下的
+              东西（关联文献库、实验、想法、在写的稿子）；不选就是你能看到的全部。
+              实验室级的资产（每日新论文、公共文献库）两种情况下都在——它们不属于
+              任何一个课题，收窄课题不该把它们也关掉。 */}
           <button
             className="buddy-scope"
             onClick={() => {
@@ -1009,14 +1026,17 @@ export function AssistantPanel({
             aria-expanded={topicOpen}
             title={
               topic
-                ? `${tr('只在这个课题的语料里查', 'Restricted to this topic')} · ${topic.name}`
-                : tr('选一个课题来收窄检索范围', 'Pick a topic to narrow the search')
+                ? `${tr('只用这个课题名下的资产', 'Only this topic’s assets')} · ${topic.name}`
+                : tr(
+                    '你能看到的所有资产；选一个课题可收窄到它名下',
+                    'Everything you can see; pick a topic to narrow to it',
+                  )
             }
             data-picked={topic ? '1' : undefined}
           >
             <Icon name="layers" size={12} />
             <span className="buddy-scope-label">
-              {topic ? topic.name : tr('全部文献库', 'All libraries')}
+              {topic ? topic.name : tr('所有资产', 'All assets')}
             </span>
             <Icon name="chevDown" size={11} />
           </button>
@@ -1059,7 +1079,7 @@ export function AssistantPanel({
                       // 搜到只剩一个时回车直接选它
                       const only = topicMatches.length === 1 ? topicMatches[0] : undefined;
                       if (e.key === 'Enter' && only) {
-                        setTopicId(only.id);
+                        pickTopic(only.id);
                         setTopicOpen(false);
                       }
                     }}
@@ -1072,12 +1092,12 @@ export function AssistantPanel({
                     role="option"
                     aria-selected={!topicId}
                     onClick={() => {
-                      setTopicId(null);
+                      pickTopic(null);
                       setTopicOpen(false);
                     }}
                   >
-                    <Icon name="book" size={13} />
-                    <span className="buddy-scope-item-label">{tr('全部文献库', 'All libraries')}</span>
+                    <Icon name="grid" size={13} />
+                    <span className="buddy-scope-item-label">{tr('所有资产', 'All assets')}</span>
                     {!topicId && <Icon name="check" size={12} />}
                   </button>
                   {projects.length > 0 && <div className="hr" style={{ margin: '4px 2px' }} />}
@@ -1089,7 +1109,7 @@ export function AssistantPanel({
                       aria-selected={p.id === topicId}
                       title={p.name}
                       onClick={() => {
-                        setTopicId(p.id);
+                        pickTopic(p.id);
                         setTopicOpen(false);
                       }}
                     >
