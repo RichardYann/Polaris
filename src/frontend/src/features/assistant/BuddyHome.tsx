@@ -1,68 +1,39 @@
-import { Icon, type IconName } from '../../components/ui/Icon';
+import { Icon } from '../../components/ui/Icon';
 import { PolarisMark } from '../../components/ui/PolarisLogo';
 import { tr } from '../../lib/i18n';
+import { greetingFor } from './greeting';
 
 /* ============================================================
    PolarisBuddy 的空态。
 
-   照 Codex 那套排：大片留白、居中一个很淡的标识、一句大字问句，下面四张卡片。
-   卡片只留图标和标题——描述文字看似贴心，实际没人读，反而把四张卡挤成小方块。
+   照 Codex 那套排：大片留白、居中一个很淡的标识、一句招呼，下面是这次开场的问句
+   和三条点一下就发出去的话。
 
-   四张卡是平台的四个阶段（找文献 / 读论文 / 理想法 / 看实验）：用户在哪个阶段就点
-   哪张，这既是能力说明也是入口。
+   这里曾经是四张固定的卡（找文献 / 读论文 / 理想法 / 看实验）。固定卡有两个治不好的
+   毛病：一是它不知道用户此刻在干什么——人正读着一篇论文，卡片还在问"要不要看看
+   实验"；二是空账号点开「看看我的实验」只会得到"你没有实验"，而新用户和公开演示
+   账号全是空账号，第一次点击就撞墙。
+
+   现在这三条由后端按「他此刻在看哪一页」+ 他自己的近况挑（见 services/buddy.py
+   compose_opening），**仍然不过模型**：开场每次都要出现，过 LLM 就是每次都花钱、
+   还得等；只读的演示账号更是连模型都调不动，走 LLM 那边会直接空掉。
    ============================================================ */
 
-export interface HomeCard {
-  icon: IconName;
-  color: string;
-  title: string;
-  prompt: string;
-}
-
-/** 写成函数而不是模块级常量：顶层 tr 在模块加载时就定死了，切换中英文不会重算。 */
-export const homeCards = (): HomeCard[] => [
-  {
-    icon: 'search',
-    color: '#2C7BE5',
-    title: tr('找相关文献', 'Find related work'),
-    prompt: tr('帮我找一下和「」相关的论文，先铺开看看有哪些。', 'Find papers related to "" — start wide.'),
-  },
-  {
-    icon: 'book',
-    color: '#8B5CF6',
-    title: tr('读懂一篇论文', 'Understand a paper'),
-    prompt: tr(
-      '帮我精读一篇论文：它解决什么问题、方法怎么工作、证据强不强。',
-      'Walk me through a paper: the problem, how the method works, how strong the evidence is.',
-    ),
-  },
-  {
-    icon: 'bulb',
-    color: '#19A974',
-    title: tr('理清一个想法', 'Sharpen an idea'),
-    prompt: tr(
-      '我有个想法想理一理：先帮我查有没有人做过，再说说和已有工作的差别。',
-      'I have an idea — check whether it has been done, then contrast it with prior work.',
-    ),
-  },
-  {
-    icon: 'flask',
-    color: '#E8590C',
-    title: tr('看看实验进展', 'Check experiments'),
-    prompt: tr(
-      '我的实验现在什么情况？跑到哪了，下一步该做什么。',
-      'How are my experiments doing, and what is next?',
-    ),
-  },
-];
-
 export function BuddyHome({
-  greeting,
+  name,
+  question,
+  suggestions,
   onPick,
 }: {
-  greeting: string;
+  /** 用户显示名；空着就只问好，不留一个孤零零的逗号 */
+  name?: string | null;
+  /** 这次开场的问句；取不到就只显示招呼，不摆一句假的 */
+  question?: string;
+  /** 三条用户可能想说的话 */
+  suggestions?: string[];
   onPick: (prompt: string) => void;
 }) {
+  const replies = (suggestions ?? []).filter((s) => s.trim());
   return (
     <div
       style={{
@@ -72,58 +43,44 @@ export function BuddyHome({
         alignItems: 'center',
         justifyContent: 'center',
         padding: '32px 20px',
-        gap: 26,
+        gap: 22,
       }}
     >
-      {/* 标识压得很淡：空屏需要一个落点，但它不该比问句更响 */}
+      {/* 标识压得很淡：空屏需要一个落点，但它不该比招呼更响 */}
       <div style={{ opacity: 0.16 }}>
         <PolarisMark size={54} dot={false} />
       </div>
 
-      <div style={{ textAlign: 'center', maxWidth: 380 }}>
+      <div style={{ textAlign: 'center', maxWidth: 400 }}>
         <div style={{ fontSize: 21, fontWeight: 600, letterSpacing: '-0.02em', lineHeight: 1.35 }}>
-          {tr('今天想做点什么发现？', 'What should we discover?')}
+          {greetingFor(new Date().getHours(), name)}
         </div>
-        {greeting && (
-          <div style={{ fontSize: 12.5, color: 'var(--text-3)', lineHeight: 1.7, marginTop: 8 }}>
-            {greeting}
+        {question && (
+          <div style={{ fontSize: 13.5, color: 'var(--text-3)', lineHeight: 1.6, marginTop: 9 }}>
+            {question}
           </div>
         )}
       </div>
 
-      <div
-        style={{
-          display: 'grid',
-          gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))',
-          gap: 10,
-          width: '100%',
-          maxWidth: 460,
-        }}
-      >
-        {homeCards().map((card) => (
-          <button
-            key={card.title}
-            onClick={() => onPick(card.prompt)}
-            style={{
-              display: 'flex',
-              flexDirection: 'column',
-              alignItems: 'flex-start',
-              gap: 14,
-              minHeight: 96,
-              padding: '13px 14px',
-              border: '0.5px solid var(--border-2)',
-              borderRadius: 12,
-              background: 'var(--surface)',
-              cursor: 'pointer',
-              textAlign: 'left',
-              font: 'inherit',
-            }}
-          >
-            <Icon name={card.icon} size={17} style={{ color: card.color }} />
-            <span style={{ fontSize: 13, fontWeight: 550, lineHeight: 1.4 }}>{card.title}</span>
-          </button>
-        ))}
-      </div>
+      {/* 竖排而不是网格：这三条是长短不一的句子，塞进等宽格子会断行断得很难看。
+          一行一条、点哪行发哪行，读起来就是「我可以这么问」。 */}
+      {replies.length > 0 && (
+        <div className="buddy-replies">
+          {replies.map((text) => (
+            <button key={text} className="buddy-reply" onClick={() => onPick(text)}>
+              <span className="buddy-reply-text">{text}</span>
+              <Icon name="arrow" size={13} />
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* 三条都没取到时给一句兜底，别让空屏真的空着 */}
+      {replies.length === 0 && !question && (
+        <div style={{ fontSize: 12.5, color: 'var(--text-4)' }}>
+          {tr('问点什么开始吧。', 'Ask me anything to get started.')}
+        </div>
+      )}
     </div>
   );
 }
