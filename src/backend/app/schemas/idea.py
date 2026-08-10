@@ -65,9 +65,19 @@ class DeepIdeaRequest(BaseModel):
     knobs: DeepKnobs = DeepKnobs()
 
 
+class DeepRunningVoyage(BaseModel):
+    voyage_id: uuid.UUID
+    status: str
+    seed: DeepSeed | None
+    pending_gate_id: uuid.UUID | None
+
+
 class DeepStateRead(BaseModel):
+    # 旧单值字段保留兼容；新客户端应使用 running_voyages。
     running_voyage_id: uuid.UUID | None
     pending_gate_id: uuid.UUID | None
+    running_voyages: list[DeepRunningVoyage]
+    max_concurrent: int
     last_run: ForgeLastRun | None
 
 

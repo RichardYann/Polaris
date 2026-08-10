@@ -1609,11 +1609,22 @@ export interface DeepKnobs {
   budget_tokens?: number | null;
 }
 
-export interface DeepIdeaState {
-  /** 进行中的深度生成任务（kind=idea_proposal） */
-  running_voyage_id: string | null;
-  /** 待人工确认的研究目标审批 */
+export interface DeepRunningVoyage {
+  voyage_id: string;
+  status: string;
+  seed: DeepSeed | null;
   pending_gate_id: string | null;
+}
+
+export interface DeepIdeaState {
+  /** 兼容旧客户端：最新一条进行中的深度生成任务。 */
+  running_voyage_id: string | null;
+  /** 兼容旧客户端：最新任务的待审批闸门。 */
+  pending_gate_id: string | null;
+  /** 当前课题全部非终态深度生成任务。 */
+  running_voyages: DeepRunningVoyage[];
+  /** 当前课题允许的深度生成并发上限。 */
+  max_concurrent: number;
   last_run: ForgeLastRun | null;
 }
 
@@ -3872,7 +3883,7 @@ export const api = {
   },
 
   // —— Idea 深度生成（Idea 2.0）——
-  /** 发起深度生成（kind=idea_proposal）；并发冲突 409；seed 引用对象不存在 404。 */
+  /** 发起深度生成（kind=idea_proposal）；同课题最多 4 个且同 seed 唯一；seed 不存在 404。 */
   startDeepIdea(projectId: string, input: { seed: DeepSeed; knobs?: DeepKnobs }): Promise<VoyageRead> {
     return requestJson<VoyageRead>(`/projects/${projectId}/ideas/deep`, 'POST', input);
   },

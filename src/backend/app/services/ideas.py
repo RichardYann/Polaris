@@ -22,8 +22,10 @@ from app.services.concepts import library_concept_ids
 from app.services.libraries import get_source_library_ids
 from app.services.projects import in_my_projects
 
-# 同项目 idea 类 voyage 互斥（docs/api-m3.md §1 + docs/api-idea2.md §2）
+# 同项目批量 idea 任务互斥；深度生成独立限流，允许不同种子并行。
 IDEA_VOYAGE_KINDS = ("idea_forge", "idea_review", "idea_proposal")
+EXCLUSIVE_IDEA_VOYAGE_KINDS = ("idea_forge", "idea_review")
+MAX_CONCURRENT_DEEP_VOYAGES = 4
 
 # 预算从 knobs 派生：每个候选 idea 预留的 token 额度（gap 分析+生成+打分+去重）
 _TOKENS_PER_IDEA = 20_000
@@ -40,7 +42,15 @@ DEEP_GATE_KINDS = ("idea_goal", "idea_pivot")
 
 
 class IdeaVoyageConflictError(Exception):
-    """同一项目已有 idea 类 voyage 在跑。"""
+    """同一项目已有互斥的 forge/review voyage 在跑。"""
+
+
+class DeepVoyageLimitError(Exception):
+    """同一项目进行中的深度生成已达到上限。"""
+
+
+class DeepSeedConflictError(Exception):
+    """同一种子已有深度生成任务尚未结束。"""
 
 
 class NotEnoughIdeasError(Exception):
@@ -61,17 +71,38 @@ class InvalidSeedError(Exception):
 async def find_running_idea_voyage(
     session: AsyncSession, project_id: uuid.UUID
 ) -> VoyageRun | None:
+    """同项目正在运行的互斥批量任务（forge/review，不含 proposal）。"""
     stmt = (
         select(VoyageRun)
         .where(
             VoyageRun.project_id == project_id,
-            VoyageRun.kind.in_(IDEA_VOYAGE_KINDS),
+            VoyageRun.kind.in_(EXCLUSIVE_IDEA_VOYAGE_KINDS),
             VoyageRun.status.not_in(tuple(TERMINAL_STATUSES)),
         )
         .order_by(VoyageRun.created_at.desc())
         .limit(1)
     )
     return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def _lock_project_idea_creation(session: AsyncSession, project_id: uuid.UUID) -> None:
+    """串行化同项目的任务创建，避免并发请求同时越过计数/互斥检查。"""
+    await session.execute(select(Project.id).where(Project.id == project_id).with_for_update())
+
+
+async def _running_deep_voyages(
+    session: AsyncSession, project_id: uuid.UUID
+) -> list[VoyageRun]:
+    stmt = (
+        select(VoyageRun)
+        .where(
+            VoyageRun.project_id == project_id,
+            VoyageRun.kind == "idea_proposal",
+            VoyageRun.status.not_in(tuple(TERMINAL_STATUSES)),
+        )
+        .order_by(VoyageRun.created_at.desc())
+    )
+    return list((await session.execute(stmt)).scalars().all())
 
 
 async def create_forge_voyage(
@@ -82,6 +113,7 @@ async def create_forge_voyage(
     created_by: uuid.UUID | None,
 ) -> VoyageRun:
     """建 idea_forge voyage（forge/review 互斥 + Activity 落记录），由调用方入队 run_voyage。"""
+    await _lock_project_idea_creation(session, project.id)
     if await find_running_idea_voyage(session, project.id) is not None:
         raise IdeaVoyageConflictError(str(project.id))
     run = VoyageRun(
@@ -227,8 +259,13 @@ async def create_deep_voyage(
     created_by: uuid.UUID | None,
 ) -> VoyageRun:
     """建 idea_proposal voyage（深度生成，docs/api-idea2.md §2），由调用方入队 run_voyage。"""
-    if await find_running_idea_voyage(session, project.id) is not None:
-        raise IdeaVoyageConflictError(str(project.id))
+    await _lock_project_idea_creation(session, project.id)
+    running = await _running_deep_voyages(session, project.id)
+    if len(running) >= MAX_CONCURRENT_DEEP_VOYAGES:
+        raise DeepVoyageLimitError(str(project.id))
+    seed = data.seed.model_dump()
+    if any(((run.checkpoint or {}).get("params") or {}).get("seed") == seed for run in running):
+        raise DeepSeedConflictError(str(project.id))
     seed_brief = await _validate_seed(
         session, project_id=project.id, seed_type=data.seed.type, value=data.seed.value
     )
@@ -259,34 +296,37 @@ async def create_deep_voyage(
 
 
 async def deep_state(session: AsyncSession, project: Project) -> dict[str, Any]:
-    """深度生成状态（docs/api-idea2.md §2）：运行中 voyage + 待审批闸门 + 上次运行。"""
-    running_stmt = (
-        select(VoyageRun)
-        .where(
-            VoyageRun.project_id == project.id,
-            VoyageRun.kind == "idea_proposal",
-            VoyageRun.status.not_in(tuple(TERMINAL_STATUSES)),
-        )
-        .order_by(VoyageRun.created_at.desc())
-        .limit(1)
-    )
-    running = (await session.execute(running_stmt)).scalar_one_or_none()
-
-    pending_gate_id: uuid.UUID | None = None
-    if running is not None:
+    """深度生成状态：最多四条运行中 voyage，各自携带种子与待审批闸门。"""
+    running = await _running_deep_voyages(session, project.id)
+    running_ids = {str(run.id) for run in running}
+    gate_by_run: dict[str, uuid.UUID] = {}
+    if running_ids:
         gate_stmt = (
             select(Gate)
             .where(
                 Gate.project_id == project.id,
                 Gate.kind.in_(DEEP_GATE_KINDS),
                 Gate.status == "pending",
-                Gate.payload["voyage_id"].as_string() == str(running.id),
             )
             .order_by(Gate.created_at.desc())
-            .limit(1)
         )
-        gate = (await session.execute(gate_stmt)).scalars().first()
-        pending_gate_id = gate.id if gate is not None else None
+        for gate in (await session.execute(gate_stmt)).scalars().all():
+            voyage_id = str((gate.payload or {}).get("voyage_id") or "")
+            if voyage_id in running_ids and voyage_id not in gate_by_run:
+                gate_by_run[voyage_id] = gate.id
+
+    running_voyages = []
+    for run in running:
+        params = ((run.checkpoint or {}).get("params") or {})
+        seed = params.get("seed") if isinstance(params.get("seed"), dict) else None
+        running_voyages.append(
+            {
+                "voyage_id": run.id,
+                "status": run.status,
+                "seed": seed,
+                "pending_gate_id": gate_by_run.get(str(run.id)),
+            }
+        )
 
     last_stmt = (
         select(VoyageRun)
@@ -303,8 +343,11 @@ async def deep_state(session: AsyncSession, project: Project) -> dict[str, Any]:
             "finished_at": last.updated_at if last.status in TERMINAL_STATUSES else None,
         }
     return {
-        "running_voyage_id": running.id if running else None,
-        "pending_gate_id": pending_gate_id,
+        # 旧字段保留一个发布周期，兼容尚未升级的前端/桌面客户端。
+        "running_voyage_id": running[0].id if running else None,
+        "pending_gate_id": gate_by_run.get(str(running[0].id)) if running else None,
+        "running_voyages": running_voyages,
+        "max_concurrent": MAX_CONCURRENT_DEEP_VOYAGES,
         "last_run": last_run,
     }
 

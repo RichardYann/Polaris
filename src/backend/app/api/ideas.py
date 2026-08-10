@@ -126,8 +126,13 @@ async def start_deep_idea(
         run = await ideas_service.create_deep_voyage(
             session, project=project, data=data, created_by=user.id
         )
-    except ideas_service.IdeaVoyageConflictError as e:
-        raise HTTPException(status.HTTP_409_CONFLICT, detail="IDEA_VOYAGE_ALREADY_RUNNING") from e
+    except ideas_service.DeepVoyageLimitError as e:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="IDEA_PROPOSAL_LIMIT_REACHED") from e
+    except ideas_service.DeepSeedConflictError as e:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail="IDEA_PROPOSAL_SEED_ALREADY_RUNNING",
+        ) from e
     except ideas_service.InvalidSeedError as e:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="SEED_NOT_FOUND") from e
     await queue.enqueue("run_voyage", str(run.id))

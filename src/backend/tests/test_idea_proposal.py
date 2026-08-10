@@ -2,7 +2,7 @@
 
 覆盖：目标构建（工具循环 + 机械验收）→ idea_goal 闸门（审批意见并入）→ 方案深耕
 → 新颖性核查 → 评审修订 → Research Proposal 入库；duplicate → idea_pivot 闸门 →
-调整方向续跑；并发 409 / 种子校验 / 权限；跳过目标确认。
+调整方向续跑；同项目四路并发 / 同种子去重 / 种子校验 / 权限；跳过目标确认。
 
 外部检索一律 external_search=False（离线）。
 """
@@ -95,14 +95,14 @@ async def test_deep_full_pipeline_with_goal_gate(client, queue_stub, bus_recorde
     run_id = voyage["id"]
     assert ("run_voyage", (run_id,), {}) in queue_stub.jobs
 
-    # idea 类 voyage 互斥：forge / 再次 deep 均 409
-    for url, body in (
-        (f"/api/projects/{project_id}/ideas/deep", {"seed": {"type": "text", "value": "x"}}),
-        (f"/api/projects/{project_id}/forge", {}),
-    ):
-        resp = await client.post(url, json=body, headers=headers)
-        assert resp.status_code == 409
-        assert resp.json()["detail"] == "IDEA_VOYAGE_ALREADY_RUNNING"
+    # 同一种子不能重复启动；不同种子的并发上限由独立测试覆盖。
+    resp = await client.post(
+        f"/api/projects/{project_id}/ideas/deep",
+        json={"seed": {"type": "text", "value": "面向 agent 自验证的深入研究"}},
+        headers=headers,
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "IDEA_PROPOSAL_SEED_ALREADY_RUNNING"
 
     # 跑到 idea_goal 闸门暂停
     engine, _bus = _make_engine()
@@ -120,6 +120,15 @@ async def test_deep_full_pipeline_with_goal_gate(client, queue_stub, bus_recorde
     state = resp.json()
     assert state["running_voyage_id"] == run_id
     assert state["pending_gate_id"] is not None
+    assert state["max_concurrent"] == 4
+    assert state["running_voyages"] == [
+        {
+            "voyage_id": run_id,
+            "status": "paused_gate",
+            "seed": {"type": "text", "value": "面向 agent 自验证的深入研究"},
+            "pending_gate_id": state["pending_gate_id"],
+        }
+    ]
 
     # 闸门 payload 含结构化 goal 与探索轨迹摘要
     gate = await _approve_pending_gate(
@@ -242,6 +251,7 @@ async def test_deep_full_pipeline_with_goal_gate(client, queue_stub, bus_recorde
     resp = await client.get(f"/api/projects/{project_id}/ideas/deep/state", headers=headers)
     state = resp.json()
     assert state["running_voyage_id"] is None and state["pending_gate_id"] is None
+    assert state["running_voyages"] == [] and state["max_concurrent"] == 4
     assert state["last_run"]["status"] == "done"
 
     # WS 事件：idea.created 已发布
@@ -250,6 +260,57 @@ async def test_deep_full_pipeline_with_goal_gate(client, queue_stub, bus_recorde
     if resp.status_code == 200:
         kinds = {a["kind"] for a in resp.json()}
         assert "idea.proposal_created" in kinds
+
+
+async def test_deep_allows_four_parallel_runs_per_project(client, queue_stub):
+    project_id, headers = await _setup_project(client, email="parallel@example.com")
+
+    run_ids: list[str] = []
+    for seed in ("并行方向 A", "并行方向 B", "并行方向 C", "并行方向 D"):
+        resp = await client.post(
+            f"/api/projects/{project_id}/ideas/deep",
+            json={"seed": {"type": "text", "value": seed}, "knobs": KNOBS},
+            headers=headers,
+        )
+        assert resp.status_code == 201, resp.text
+        run_ids.append(resp.json()["id"])
+
+        if seed == "并行方向 A":
+            duplicate = await client.post(
+                f"/api/projects/{project_id}/ideas/deep",
+                json={"seed": {"type": "text", "value": seed}, "knobs": KNOBS},
+                headers=headers,
+            )
+            assert duplicate.status_code == 409
+            assert duplicate.json()["detail"] == "IDEA_PROPOSAL_SEED_ALREADY_RUNNING"
+
+    overflow = await client.post(
+        f"/api/projects/{project_id}/ideas/deep",
+        json={"seed": {"type": "text", "value": "并行方向 E"}, "knobs": KNOBS},
+        headers=headers,
+    )
+    assert overflow.status_code == 409
+    assert overflow.json()["detail"] == "IDEA_PROPOSAL_LIMIT_REACHED"
+
+    state = (
+        await client.get(f"/api/projects/{project_id}/ideas/deep/state", headers=headers)
+    ).json()
+    assert state["max_concurrent"] == 4
+    assert {run["voyage_id"] for run in state["running_voyages"]} == set(run_ids)
+    assert {run["seed"]["value"] for run in state["running_voyages"]} == {
+        "并行方向 A",
+        "并行方向 B",
+        "并行方向 C",
+        "并行方向 D",
+    }
+    assert state["running_voyage_id"] in run_ids  # 旧客户端兼容字段
+
+    # Forge/review 使用另一把互斥锁，可与深度生成并行；Forge 自身仍只能有一个。
+    forge = await client.post(f"/api/projects/{project_id}/forge", json={}, headers=headers)
+    assert forge.status_code == 201, forge.text
+    second_forge = await client.post(f"/api/projects/{project_id}/forge", json={}, headers=headers)
+    assert second_forge.status_code == 409
+    assert second_forge.json()["detail"] == "IDEA_VOYAGE_ALREADY_RUNNING"
 
 
 async def test_deep_duplicate_pivot_and_leftover_mustfix(client, queue_stub, bus_recorder):

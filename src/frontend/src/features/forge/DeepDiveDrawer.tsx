@@ -116,7 +116,13 @@ export function DeepDiveDrawer({ open, onClose, pid, initialSeedIdea }: DeepDive
     },
     onError: (e) => {
       if (e instanceof ApiError && e.status === 409) {
-        toast(tr('已有 AI 想法任务在运行，请等待其完成。', 'An AI idea task is already running — wait for it to finish.'), 'error');
+        const message =
+          e.message === 'IDEA_PROPOSAL_LIMIT_REACHED'
+            ? tr('本课题已有 4 个深度生成任务，请等待至少一个完成。', 'This topic already has 4 Deep Dive tasks — wait for one to finish.')
+            : e.message === 'IDEA_PROPOSAL_SEED_ALREADY_RUNNING'
+              ? tr('这个种子已经有一个深度生成任务。', 'This seed already has a Deep Dive task.')
+              : tr('暂时无法启动深度生成任务。', 'The Deep Dive task cannot be started right now.');
+        toast(message, 'error');
         void queryClient.invalidateQueries({ queryKey: ['deep-state', pid] });
         void queryClient.invalidateQueries({ queryKey: ['forge-state', pid] });
       } else {

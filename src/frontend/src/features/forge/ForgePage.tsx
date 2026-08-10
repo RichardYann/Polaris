@@ -423,12 +423,24 @@ export function ForgePage() {
     enabled: !!pid,
     retry: false,
     refetchInterval: (q) =>
-      q.state.data?.running_voyage_id || q.state.data?.pending_gate_id ? 5_000 : 60_000,
+      (q.state.data?.running_voyages?.length ?? 0) > 0 || q.state.data?.running_voyage_id ? 5_000 : 60_000,
   });
   const deep = deepQuery.data;
-  const deepRunningId = deep?.running_voyage_id ?? null;
-  // forge / 深度生成同项目互斥（后端共用 409）
-  const running = !!state?.running_voyage_id || !!deepRunningId;
+  // 兼容旧后端：新字段缺失时退回单任务形状。
+  const deepRuns = deep?.running_voyages ?? (deep?.running_voyage_id
+    ? [{
+        voyage_id: deep.running_voyage_id,
+        status: 'executing',
+        seed: null,
+        pending_gate_id: deep.pending_gate_id,
+      }]
+    : []);
+  const deepLimit = deep?.max_concurrent ?? 4;
+  const deepAtLimit = deepRuns.length >= deepLimit;
+  const runningSeedIdeaIds = new Set(
+    deepRuns.flatMap((run) => run.seed?.type === 'idea' ? [run.seed.value] : []),
+  );
+  const forgeReviewRunning = !!state?.running_voyage_id;
 
   const ideasQuery = useQuery({
     queryKey: ['ideas', pid, statusFilter, sort, depthFilter, typeFilter],
@@ -588,20 +600,22 @@ export function ForgePage() {
         )}
         <div style={{ marginLeft: 'auto' }}>
           <div className="row gap8">
-            <button className="btn btn-soft sm" disabled={!pid || running} onClick={() => setModalOpen(true)}>
+            <button className="btn btn-soft sm" disabled={!pid || forgeReviewRunning} onClick={() => setModalOpen(true)}>
               <Icon name="play" size={13} />
               {tr('运行 Idea Forge', 'Run Idea Forge')}
             </button>
-            <button className="btn btn-primary sm" disabled={!pid || running} onClick={() => openDeepDrawer()}>
-              {running ? (
+            <button className="btn btn-primary sm" disabled={!pid || deepAtLimit} onClick={() => openDeepDrawer()}>
+              {deepAtLimit ? (
                 <>
-                  <Icon name="refresh" size={13} style={{ animation: 'spin 1s linear infinite' }} />
-                  {tr('运行中…', 'Running…')}
+                  <Icon name="layers" size={13} />
+                  {tr(`已达上限 ${deepRuns.length}/${deepLimit}`, `Limit reached ${deepRuns.length}/${deepLimit}`)}
                 </>
               ) : (
                 <>
                   <Icon name="sparkle" size={13} />
-                  {tr('深度生成', 'Deep Dive')}
+                  {deepRuns.length > 0
+                    ? tr(`深度生成 ${deepRuns.length}/${deepLimit}`, `Deep Dive ${deepRuns.length}/${deepLimit}`)
+                    : tr('深度生成', 'Deep Dive')}
                 </>
               )}
             </button>
@@ -609,11 +623,12 @@ export function ForgePage() {
         </div>
       </div>
 
-      {/* 待确认研究目标提示 */}
-      {deep?.pending_gate_id && (
+      {/* 各深度生成任务的待确认研究目标 */}
+      {deepRuns.filter((run) => run.pending_gate_id).map((run) => (
         <div
+          key={`gate-${run.voyage_id}`}
           className="card card-pad hoverable"
-          onClick={() => openGates(deep.pending_gate_id)}
+          onClick={() => openGates(run.pending_gate_id!)}
           style={{ marginBottom: 16, borderColor: 'var(--warn)', background: 'var(--warn-bg)' }}
         >
           <div className="row gap10">
@@ -624,17 +639,21 @@ export function ForgePage() {
             <span style={{ fontSize: 13.5, fontWeight: 650, color: 'var(--warn-tx)' }}>
               {tr('有研究目标待确认 — AI 已完成目标构建，等你确认后继续起草研究方案', 'A research goal awaits your confirmation — the AI built it and will draft the proposal once you confirm')}
             </span>
-            <span style={{ marginLeft: 'auto', fontSize: 12, color: 'var(--warn-tx)' }}>{tr('去审批', 'Open approvals')}</span>
+            <span className="mono" style={{ marginLeft: 'auto', fontSize: 10.5, color: 'var(--warn-tx)' }}>
+              {run.voyage_id.slice(0, 8)}…
+            </span>
+            <span style={{ fontSize: 12, color: 'var(--warn-tx)' }}>{tr('去审批', 'Open approvals')}</span>
             <Icon name="arrow" size={14} style={{ color: 'var(--warn-tx)' }} />
           </div>
         </div>
-      )}
+      ))}
 
-      {/* 深度生成进行中 banner */}
-      {deepRunningId && (
+      {/* 深度生成进行中 banners */}
+      {deepRuns.filter((run) => !run.pending_gate_id).map((run) => (
         <div
+          key={run.voyage_id}
           className="card card-pad hoverable"
-          onClick={() => navigate(`/voyages/${deepRunningId}`)}
+          onClick={() => navigate(`/voyages/${run.voyage_id}`)}
           style={{ marginBottom: 16, borderColor: 'var(--accent-soft-2)', background: 'var(--accent-soft)' }}
         >
           <div className="row gap10">
@@ -644,15 +663,15 @@ export function ForgePage() {
             </span>
             <span style={{ fontSize: 13.5, fontWeight: 650 }}>{tr('深度生成进行中 — 点击查看目标构建 / 方案起草的实时进度', 'Deep Dive in progress — click to watch goal building / proposal drafting live')}</span>
             <span className="mono" style={{ fontSize: 10.5, color: 'var(--text-3)', marginLeft: 'auto' }}>
-              {deepRunningId.slice(0, 8)}…
+              {run.voyage_id.slice(0, 8)}…
             </span>
             <Icon name="arrow" size={14} style={{ color: 'var(--accent-text)' }} />
           </div>
         </div>
-      )}
+      ))}
 
-      {/* 进行中任务 banner（深度生成任务另有专属 banner，避免重复） */}
-      {state?.running_voyage_id && state.running_voyage_id !== deepRunningId && (
+      {/* Forge / review 进行中任务 banner */}
+      {state?.running_voyage_id && (
         <div
           className="card card-pad hoverable"
           onClick={() => navigate(`/voyages/${state.running_voyage_id}`)}
@@ -841,7 +860,7 @@ export function ForgePage() {
               icon="bulb"
               title={tr('候选池为空', 'The candidate pool is empty')}
               action={
-                <button className="btn btn-primary" disabled={running} onClick={() => setModalOpen(true)}>
+                <button className="btn btn-primary" disabled={forgeReviewRunning} onClick={() => setModalOpen(true)}>
                   <Icon name="play" size={14} />
                   {tr('运行 Idea Forge', 'Run Idea Forge')}
                 </button>
@@ -860,7 +879,11 @@ export function ForgePage() {
               selected={selected.has(idea.id)}
               onToggleSelect={() => toggleSelect(idea.id)}
               onOpen={() => navigate(`/ideas/${idea.id}`)}
-              onDeepen={view === 'trash' || running ? undefined : () => openDeepDrawer({ id: idea.id, title: idea.title })}
+              onDeepen={
+                view === 'trash' || deepAtLimit || runningSeedIdeaIds.has(idea.id)
+                  ? undefined
+                  : () => openDeepDrawer({ id: idea.id, title: idea.title })
+              }
               onTrash={() => trashOne.mutate(idea.id)}
               onRestore={() => restoreOne.mutate(idea.id)}
               onDelete={() =>
