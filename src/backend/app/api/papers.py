@@ -21,6 +21,7 @@ from app.api.chat_stream import sse_frame as _sse_frame
 from app.core.db import get_session
 from app.core.events import paper_task_channel, paper_task_log_key
 from app.core.llm.router import get_llm_router
+from app.core.queue import TaskQueue, get_task_queue
 from app.core.redis import get_redis_dep
 from app.models.user import User
 from app.schemas.paper import (
@@ -42,6 +43,7 @@ from app.schemas.paper import (
     PaperPdfUrlCreate,
     PaperRead,
     PaperTagsUpdate,
+    PaperTaskStart,
     PaperUpdate,
     ResolvedPaperRead,
     TagRead,
@@ -54,7 +56,6 @@ from app.services import paper_import as paper_import_service
 from app.services import paper_index as paper_index_service
 from app.services import paper_wiki as paper_wiki_service
 from app.services import papers as papers_service
-from app.services import wiki_compile as wiki_compile_service
 from app.services.literature.pdf_extract import figure_path
 
 logger = logging.getLogger(__name__)
@@ -153,9 +154,7 @@ async def list_papers(
     published_to: datetime | None = Query(default=None),
     created_from: datetime | None = Query(default=None),
     created_to: datetime | None = Query(default=None),
-    daily_only: bool = Query(
-        default=False, description="只看从每日论文池自动收录的"
-    ),
+    daily_only: bool = Query(default=False, description="只看从每日论文池自动收录的"),
     last_sync_only: bool = Query(
         default=False,
         description="只看最近一次同步新增的（没同步过则返回空；「最新收录」视图用）",
@@ -406,9 +405,7 @@ async def restore_project_paper(
     return await _paper_detail(session, view, user.id)
 
 
-@router.delete(
-    "/projects/{project_id}/papers/{paper_id}", status_code=status.HTTP_204_NO_CONTENT
-)
+@router.delete("/projects/{project_id}/papers/{paper_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_project_paper(
     project_id: uuid.UUID,
     paper_id: uuid.UUID,
@@ -445,8 +442,7 @@ async def resolve_paper_meta(
         title=str(fields.get("title") or ""),
         year=fields.get("year"),
         authors=[
-            str(a.get("name") if isinstance(a, dict) else a)
-            for a in (fields.get("authors") or [])
+            str(a.get("name") if isinstance(a, dict) else a) for a in (fields.get("authors") or [])
         ][:8],
     )
 
@@ -708,24 +704,22 @@ async def extract_paper_figures(
 # ---- 图文交织 wiki 重编译（docs/api-lit.md §6.6，同步调用约 1 分钟） ----
 
 
-@router.post("/papers/{paper_id}/recompile", response_model=PaperDetail)
+@router.post("/papers/{paper_id}/recompile", response_model=PaperTaskStart, status_code=202)
 async def recompile_paper(
     paper_id: uuid.UUID,
     session: AsyncSession = Depends(get_session),
     user: User = Depends(require_llm_task),
-) -> PaperDetail:
-    """重跑筛选注释 + 图文编译，覆盖这篇论文的解读；无 PDF 时跳过图片仅重写文字。
+    redis: Redis = Depends(get_redis_dep),
+    queue: TaskQueue = Depends(get_task_queue),
+) -> PaperTaskStart:
+    """Queue a durable background recompile and return immediately."""
+    await _get_member_paper(session, paper_id, user, with_concepts=True)
+    from app.services.paper_recompile import launch_recompile
 
-    解读全平台一份：重编译对所有入口生效，谁都能重编，以最新一次为准。"""
-    paper = await _get_member_paper(session, paper_id, user, with_concepts=True)
-    try:
-        paper = await wiki_compile_service.recompile_paper(session, paper, user_id=user.id)
-    except asyncio.CancelledError:
-        raise
-    except Exception as e:  # noqa: BLE001 — LLM 空响应/调用失败等 → 502
-        logger.warning("recompile failed for paper %s", paper_id, exc_info=True)
-        raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail="COMPILE_FAILED") from e
-    return await _paper_detail(session, paper, user.id)
+    task_id = await launch_recompile(redis=redis, queue=queue, paper_id=paper_id, user_id=user.id)
+    if task_id is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="PAPER_COMPILE_RUNNING")
+    return PaperTaskStart(task_id=task_id)
 
 
 # ---- 索引状态与手动重建（docs/api-lit.md §9） ----

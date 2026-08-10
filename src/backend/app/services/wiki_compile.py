@@ -9,10 +9,12 @@
 
 import re
 import uuid
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.llm.base import Message
@@ -221,6 +223,7 @@ async def recompile_paper(
     view: PaperView,
     *,
     user_id: uuid.UUID | None = None,
+    emit: Callable[[str, str, str | None], Awaitable[None]] | None = None,
 ) -> PaperView:
     """重跑筛选注释 + 图文编译，覆盖这篇论文的唯一解读并落库（docs/api-lit.md §6.6）。
 
@@ -231,6 +234,11 @@ async def recompile_paper(
     membership = view.membership
     project_id = view.project_id
 
+    async def progress(stage: str, status: str, detail: str | None = None) -> None:
+        if emit is not None:
+            await emit(stage, status, detail)
+
+    await progress("figures", "running")
     if paper.pdf_path and Path(paper.pdf_path).exists():
         # 从未提取过，或上一轮一张重要图都没选出来（多为旧提取逻辑漏掉矢量图）→ 重提候选
         if paper.figures is None or not any(f.get("important") for f in paper.figures):
@@ -248,10 +256,14 @@ async def recompile_paper(
                 library_id=membership.library_id,
             )
         await session.commit()
+        await progress("figures", "ok")
+    else:
+        await progress("figures", "skipped", "no PDF")
 
     # on_compile 模式且尚无机构时，让本次编译顺带带回作者↔机构映射（省一次专门调用）
     mode = await get_affiliation_extraction_mode(session)
     collect_affs = mode == "on_compile" and not paper.affiliations
+    await progress("compile", "running")
     compiled = await compile_paper(
         paper,
         llm=llm,
@@ -260,6 +272,11 @@ async def recompile_paper(
         library_id=membership.library_id,  # 从库里发起的重编译记方向库账（P6）
         collect_affiliations=collect_affs,
     )
+    await progress("compile", "ok")
+    exists_now = await session.scalar(select(Paper.id).where(Paper.id == paper.id))
+    if exists_now is None:
+        raise LookupError("论文在编译过程中已被删除")
+    await progress("save", "running")
     await upsert_wiki(
         session,
         paper=paper,
@@ -272,8 +289,11 @@ async def recompile_paper(
     if compiled.author_affiliations and not paper.affiliations:
         apply_author_affiliations(paper, compiled.author_affiliations)
     await session.commit()
+    await progress("save", "ok")
     # 单篇概念上链：新介绍里的 [[双链]] 建词条并关联（否则点击提示"概念尚未入库"）
+    await progress("concepts", "running")
     await link_paper_concepts(
         session, paper, membership, llm=llm, user_id=user_id, project_id=project_id
     )
+    await progress("concepts", "ok")
     return view

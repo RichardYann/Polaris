@@ -103,6 +103,10 @@ class PaperFiguresResponse(BaseModel):
     figures: list[PaperFigure]
 
 
+class PaperTaskStart(BaseModel):
+    task_id: str
+
+
 class PaperDetail(PaperRead):
     abstract: str | None
     wiki_content: str | None

@@ -34,7 +34,7 @@ EMBED_TEXT_MAX_CHARS = 2000
 # 推送来的论文在语义检索里根本搜不到，而只管一条路径又名不副实。旧键的存量值不迁移，
 # 读不到就取新默认（开）。
 
-_OWNER_TTL_SECONDS = 600  # paper_task_owner 归属 key 存活时间
+_OWNER_TTL_SECONDS = 2 * 3600  # 覆盖排队、长时间编译和迟到的 SSE 订阅
 
 
 def paper_task_owner_key(task_id: str) -> str:
@@ -326,9 +326,7 @@ async def _run_enrichment(
                     bus, task_id, "error", {"message": "paper not found"}
                 )
                 return
-            target = (
-                await session.get(DirectionLibrary, library_id) if library_id else None
-            )
+            target = await session.get(DirectionLibrary, library_id) if library_id else None
             await enrich_paper(
                 session,
                 paper,

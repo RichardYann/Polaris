@@ -39,7 +39,7 @@ def paper_task_log_key(task_id: str) -> str:
     return f"paper_task:{task_id}:log"
 
 
-_PAPER_TASK_LOG_TTL = 600  # 回放日志存活时间（秒），与归属 key 一致
+_PAPER_TASK_LOG_TTL = 2 * 3600  # 覆盖排队、长时间编译和迟到的 SSE 订阅
 
 
 async def publish_paper_task_event(

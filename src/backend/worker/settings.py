@@ -12,6 +12,7 @@ from worker.tasks import (
     index_papers_fulltext_task,
     match_user_publications,
     ping_task,
+    recompile_paper_task,
     reconcile_stale_voyages,
     reconcile_stuck_voyages,
     resume_voyage,
@@ -26,6 +27,7 @@ VOYAGE_JOB_TIMEOUT_SECONDS = 12 * 3600
 class WorkerSettings:
     functions = [
         ping_task,
+        recompile_paper_task,
         func(run_voyage, timeout=VOYAGE_JOB_TIMEOUT_SECONDS),
         func(resume_voyage, timeout=VOYAGE_JOB_TIMEOUT_SECONDS),
         match_user_publications,

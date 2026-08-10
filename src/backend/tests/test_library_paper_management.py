@@ -13,6 +13,7 @@ from app.core.db import get_sessionmaker
 from app.models.library_direction import LibraryPaper
 from app.models.paper import Concept, Paper, paper_concepts
 from app.models.user import User
+from app.services.paper_recompile import run_recompile_task
 from tests.conftest import register_and_login
 
 BIBTEX_ENTRY = """@inproceedings{smith2025bench,
@@ -206,11 +207,21 @@ async def test_standalone_manual_add_bibtex(client):
     assert resp.json()["detail"] == "PAPER_EXISTS"
 
 
-async def test_standalone_recompile_via_paper_endpoint(client):
+async def test_standalone_recompile_via_paper_endpoint(client, fake_redis, queue_stub):
     creator, _admin, lib_id = await _setup(client, prefix="p9d-recompile")
     p1 = await _seed_paper(lib_id, title="Recompile me", status="scored")
     resp = await client.post(f"/api/papers/{p1}/recompile", headers=creator)
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 202, resp.text
+    task_id = resp.json()["task_id"]
+    _, args, _ = queue_stub.jobs[-1]
+    assert args[:2] == (task_id, p1)
+    await run_recompile_task(
+        redis=fake_redis,
+        task_id=args[0],
+        paper_id=uuid.UUID(args[1]),
+        user_id=uuid.UUID(args[2]),
+    )
+    resp = await client.get(f"/api/papers/{p1}", headers=creator)
     assert resp.json()["has_wiki"] is True
 
 

@@ -17,6 +17,7 @@ from app.services.literature.pdf_extract import (
     figure_path,
     save_pdf,
 )
+from app.services.paper_recompile import run_recompile_task
 from app.services.wiki_compile import compile_paper, strip_invalid_figure_markers
 from tests.conftest import add_paper, membership_of, register_and_login, wiki_of
 
@@ -180,7 +181,8 @@ async def _setup_paper(client, *, status: str = "scored"):
     resp = await client.post("/api/projects", json={"name": "recompile-proj"}, headers=headers)
     project_id = resp.json()["id"]
     async with get_sessionmaker()() as session:
-        paper = await add_paper(session,
+        paper = await add_paper(
+            session,
             project_id=uuid.UUID(project_id),
             source="manual",
             title="Recompiled Paper",
@@ -193,7 +195,23 @@ async def _setup_paper(client, *, status: str = "scored"):
     return project_id, headers, paper_id
 
 
-async def test_recompile_with_pdf_full_flow(client):
+async def _queue_run_and_get(client, headers, paper_id, fake_redis, queue_stub):
+    queued = await client.post(f"/api/papers/{paper_id}/recompile", headers=headers)
+    assert queued.status_code == 202, queued.text
+    task_id = queued.json()["task_id"]
+    assert queue_stub.jobs[-1][0] == "recompile_paper_task"
+    _, args, _ = queue_stub.jobs[-1]
+    assert args[:2] == (task_id, paper_id)
+    await run_recompile_task(
+        redis=fake_redis,
+        task_id=args[0],
+        paper_id=uuid.UUID(args[1]),
+        user_id=uuid.UUID(args[2]),
+    )
+    return await client.get(f"/api/papers/{paper_id}", headers=headers)
+
+
+async def test_recompile_with_pdf_full_flow(client, fake_redis, queue_stub):
     project_id, headers, paper_id = await _setup_paper(client, status="scored")
     pdf_path = save_pdf(paper_id, _pdf_with_streams([_opaque_png_bytes(400, 300)]))
     async with get_sessionmaker()() as session:
@@ -201,7 +219,7 @@ async def test_recompile_with_pdf_full_flow(client):
         paper.pdf_path = str(pdf_path)
         await session.commit()
 
-    resp = await client.post(f"/api/papers/{paper_id}/recompile", headers=headers)
+    resp = await _queue_run_and_get(client, headers, paper_id, fake_redis, queue_stub)
     assert resp.status_code == 200, resp.text
     detail = resp.json()
     assert "![[fig:0]]" in detail["wiki_content"]  # 图文编译带标记
@@ -241,15 +259,15 @@ async def test_recompile_with_pdf_full_flow(client):
         assert extract_rows == []
 
     # 再跑一次：覆盖 wiki_content，仍成功（重跑 annotate + 编译）
-    resp = await client.post(f"/api/papers/{paper_id}/recompile", headers=headers)
+    resp = await _queue_run_and_get(client, headers, paper_id, fake_redis, queue_stub)
     assert resp.status_code == 200
     assert resp.json()["status"] == "compiled"
 
 
-async def test_recompile_without_pdf_text_only_keeps_status(client):
+async def test_recompile_without_pdf_text_only_keeps_status(client, fake_redis, queue_stub):
     _, headers, paper_id = await _setup_paper(client, status="included")
 
-    resp = await client.post(f"/api/papers/{paper_id}/recompile", headers=headers)
+    resp = await _queue_run_and_get(client, headers, paper_id, fake_redis, queue_stub)
     assert resp.status_code == 200, resp.text
     detail = resp.json()
     assert detail["wiki_content"].startswith("## TL;DR")  # 摘要降级纯文字编译
@@ -276,7 +294,8 @@ async def test_obsidian_export_rewrites_figure_markers(client):
     resp = await client.post("/api/projects", json={"name": "export-proj"}, headers=headers)
     project_id = resp.json()["id"]
     async with get_sessionmaker()() as session:
-        paper = await add_paper(session,
+        paper = await add_paper(
+            session,
             project_id=uuid.UUID(project_id),
             source="arxiv",
             arxiv_id="2406.20001",

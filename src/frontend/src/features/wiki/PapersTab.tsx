@@ -50,6 +50,7 @@ import { AddToButton } from '../library/AddToPopover';
 import { PaperProgressModal } from '../library/PaperProgressModal';
 import { paperDragProps } from '../assistant/paperDrag';
 import { clampLines } from '../../lib/clamp';
+import { subscribeSse } from '../../lib/sse';
 
 /* ============================================================
    论文库 Tab：左列表（过滤/搜索/排序/加载更多 + 添加文献/导出）
@@ -58,6 +59,26 @@ import { clampLines } from '../../lib/clamp';
    ============================================================ */
 
 const PAGE_SIZE = 20;
+
+function waitForPaperTask(taskId: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const cancel = subscribeSse(`/paper-tasks/${taskId}/events`, {
+      onEvent: (event, data) => {
+        if (event === 'done') {
+          cancel();
+          resolve();
+        } else if (event === 'error') {
+          cancel();
+          try {
+            reject(new Error((JSON.parse(data) as { message?: string }).message ?? '编译失败'));
+          } catch {
+            reject(new Error('编译失败'));
+          }
+        }
+      },
+    });
+  });
+}
 
 /** 论文库视图（docs/api-lit.md §8.5）：全部 = 已纳入（相关性达标）的文献；
     相关性不足的进回收站，不显示不计数。 */
@@ -1188,7 +1209,9 @@ export function PapersTab({ pid, libraryId, selectedId, onSelect, onOpenConcept,
     (paperId: string) => {
       void compilePending.run(paperId, async () => {
         try {
-          await api.recompilePaper(paperId);
+          const { task_id: taskId } = await api.recompilePaper(paperId);
+          toast(tr('已加入后台编译队列', 'Queued for background compilation'), 'info');
+          await waitForPaperTask(taskId);
           toast(tr('编译完成，介绍已更新', 'Compiled — the intro has been updated'), 'ok');
           void queryClient.invalidateQueries({ queryKey: ['paper', scopeId, paperId] });
           void queryClient.invalidateQueries({ queryKey: ['paper-figures', paperId] });

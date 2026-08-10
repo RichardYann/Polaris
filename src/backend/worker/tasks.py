@@ -32,6 +32,20 @@ async def ping_task(ctx: dict[str, Any], message: str = "ping") -> str:
     return f"pong: {message}"
 
 
+async def recompile_paper_task(
+    ctx: dict[str, Any], task_id: str, paper_id: str, user_id: str
+) -> None:
+    """Recompile a paper outside the HTTP request lifecycle."""
+    from app.services.paper_recompile import run_recompile_task
+
+    await run_recompile_task(
+        redis=ctx["redis"],
+        task_id=task_id,
+        paper_id=uuid.UUID(paper_id),
+        user_id=uuid.UUID(user_id),
+    )
+
+
 def _make_engine() -> VoyageEngine:
     return VoyageEngine(event_bus=EventBus(get_redis()))
 
@@ -75,9 +89,7 @@ async def reconcile_stuck_voyages(ctx: dict[str, Any]) -> None:
         ids = (
             (
                 await session.execute(
-                    select(VoyageRun.id).where(
-                        VoyageRun.status.in_(tuple(IN_FLIGHT_STATUSES))
-                    )
+                    select(VoyageRun.id).where(VoyageRun.status.in_(tuple(IN_FLIGHT_STATUSES)))
                 )
             )
             .scalars()
