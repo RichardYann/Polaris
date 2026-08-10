@@ -18,7 +18,7 @@ from app.services.libraries import (
     get_library_for_project,
     get_membership,
 )
-from app.services.literature import get_arxiv_client, get_openalex_client
+from app.services.literature import get_arxiv_client, get_openalex_client, get_s2_client
 from app.services.literature.arxiv import ArxivRateLimitedError, normalize_arxiv_id
 
 logger = logging.getLogger(__name__)
@@ -165,10 +165,67 @@ async def _fields_from_doi(doi: str) -> dict[str, Any]:
     }
 
 
+def normalize_corpus_id(raw: str) -> str:
+    """Accept a bare numeric id or Semantic Scholar's ``CorpusId:<id>`` form."""
+    value = raw.strip()
+    if value.lower().startswith("corpusid:"):
+        value = value.split(":", 1)[1].strip()
+    if not value.isdigit() or int(value) <= 0:
+        raise ParseFailedError("Corpus ID 必须是正整数，例如 13756489")
+    return str(int(value))
+
+
+async def _fields_from_corpus_id(corpus_id: str) -> dict[str, Any]:
+    normalized = normalize_corpus_id(corpus_id)
+    try:
+        meta = await get_s2_client().get_paper(f"CorpusId:{normalized}")
+    except Exception as e:  # noqa: BLE001 - upstream errors become an import error
+        raise ParseFailedError(
+            f"Semantic Scholar 上查不到 Corpus ID {normalized}（{type(e).__name__}）"
+        ) from e
+    title = _clean(meta.get("title"))
+    if not title:
+        raise ParseFailedError(f"Semantic Scholar 上查不到 Corpus ID {normalized}")
+    external = meta.get("externalIds") or {}
+    arxiv_id = normalize_arxiv_id(str(external["ArXiv"])) if external.get("ArXiv") else None
+    doi = _clean(str(external["DOI"])) if external.get("DOI") else None
+    authors = [
+        {"name": str(author["name"]).strip()}
+        for author in (meta.get("authors") or [])
+        if isinstance(author, dict) and str(author.get("name") or "").strip()
+    ]
+    oa_pdf = meta.get("openAccessPdf") or {}
+    pdf_source_url = _clean(oa_pdf.get("url")) if isinstance(oa_pdf, dict) else None
+    return {
+        "source": "semantic_scholar",
+        "title": title,
+        "authors": authors or None,
+        "abstract": _clean(meta.get("abstract")),
+        "year": meta.get("year"),
+        "venue": _clean(meta.get("venue") or (meta.get("journal") or {}).get("name")),
+        "doi": doi,
+        "url": _clean(meta.get("url")),
+        "arxiv_id": arxiv_id,
+        "published_at": _parse_iso(meta.get("publicationDate")),
+        "external_ids": {
+            key: value
+            for key, value in (
+                ("s2", meta.get("paperId")),
+                ("corpus_id", normalized),
+                ("arxiv", arxiv_id),
+                ("doi", doi),
+                ("pdf_url", pdf_source_url),
+            )
+            if value
+        },
+    }
+
+
 async def resolve_fields(
     *,
     arxiv_id: str | None = None,
     doi: str | None = None,
+    corpus_id: str | None = None,
     bibtex: str | None = None,
 ) -> dict[str, Any]:
     """按来源解析论文字段（arxiv > doi > bibtex）；失败抛 ParseFailedError。"""
@@ -176,6 +233,8 @@ async def resolve_fields(
         return await _fields_from_arxiv(arxiv_id)
     if doi:
         return await _fields_from_doi(doi)
+    if corpus_id:
+        return await _fields_from_corpus_id(corpus_id)
     return parse_bibtex_entry(bibtex or "")
 
 
@@ -191,13 +250,13 @@ async def create_pool_paper(
     调用方负责先查池去重（find_pool_paper）与收尾 commit。有 arxiv_id 的尽力而为
     补下 PDF + 抽全文；全文到手且无机构时 LLM 补机构（计费按传入的 user/project 归因）。
     """
-    external_ids: dict[str, str] = {}
+    external_ids: dict[str, str] = dict(fields.get("external_ids") or {})
     if fields.get("arxiv_id"):
         external_ids["arxiv"] = fields["arxiv_id"]
     if fields.get("doi"):
         external_ids["doi"] = fields["doi"]
     paper = new_paper(
-        source="manual",
+        source=fields.get("source") or "manual",
         dedup_key=pool_dedup_key(
             arxiv_id=fields.get("arxiv_id"),
             doi=fields.get("doi"),
@@ -263,13 +322,13 @@ async def create_pool_paper_stub(
     重活（下载/抽取/向量化/打分）交给后台任务 enrich_paper 分阶段做；此处只做同步、
     确定性的建行工作。调用方负责先查池去重（find_pool_paper）与收尾 commit。
     """
-    external_ids: dict[str, str] = {}
+    external_ids: dict[str, str] = dict(fields.get("external_ids") or {})
     if fields.get("arxiv_id"):
         external_ids["arxiv"] = fields["arxiv_id"]
     if fields.get("doi"):
         external_ids["doi"] = fields["doi"]
     paper = new_paper(
-        source="manual",
+        source=fields.get("source") or "manual",
         dedup_key=pool_dedup_key(
             arxiv_id=fields.get("arxiv_id"),
             doi=fields.get("doi"),
@@ -306,6 +365,7 @@ async def resolve_or_create_pool_paper(
     *,
     arxiv_id: str | None = None,
     doi: str | None = None,
+    corpus_id: str | None = None,
     bibtex: str | None = None,
     title: str | None = None,
 ) -> ManualAddResult:
@@ -330,9 +390,14 @@ async def resolve_or_create_pool_paper(
         paper = (await session.execute(stmt)).scalars().first()
     if paper is not None:
         return ManualAddResult(paper=paper, created=False)
-    if not (normalized_arxiv or clean_doi or (bibtex and bibtex.strip())):
+    if not (
+        normalized_arxiv
+        or clean_doi
+        or (corpus_id and corpus_id.strip())
+        or (bibtex and bibtex.strip())
+    ):
         raise ParseFailedError("按标题没有找到这篇论文，请提供 arXiv 编号或 DOI")
-    fields = await resolve_fields(arxiv_id=arxiv_id, doi=doi, bibtex=bibtex)
+    fields = await resolve_fields(arxiv_id=arxiv_id, doi=doi, corpus_id=corpus_id, bibtex=bibtex)
     # 解析出的规范 id 再查一次池（输入可能是版本号 / 别名，bibtex 里也可能带 DOI）
     paper = await find_pool_paper(
         session,
@@ -358,6 +423,7 @@ async def add_manual_paper(
     project_id: uuid.UUID,
     arxiv_id: str | None = None,
     doi: str | None = None,
+    corpus_id: str | None = None,
     bibtex: str | None = None,
 ) -> ManualAddResult:
     """手动添加一篇文献到课题起源库（source=manual，成员行 status=included）。
@@ -373,6 +439,7 @@ async def add_manual_paper(
         library=library,
         arxiv_id=arxiv_id,
         doi=doi,
+        corpus_id=corpus_id,
         bibtex=bibtex,
         project_id=project_id,
     )
@@ -384,6 +451,7 @@ async def add_manual_paper_to_library(
     library: Any,
     arxiv_id: str | None = None,
     doi: str | None = None,
+    corpus_id: str | None = None,
     bibtex: str | None = None,
     project_id: uuid.UUID | None = None,
 ) -> ManualAddResult:
@@ -395,7 +463,7 @@ async def add_manual_paper_to_library(
     - 新论文只落元数据行；PDF 下载/全文抽取/向量化/打分由后台任务补全
     project_id 仅用于 LLM 记账归因（补机构等），独立库为空。
     """
-    fields = await resolve_fields(arxiv_id=arxiv_id, doi=doi, bibtex=bibtex)
+    fields = await resolve_fields(arxiv_id=arxiv_id, doi=doi, corpus_id=corpus_id, bibtex=bibtex)
     dedup_key = pool_dedup_key(
         arxiv_id=fields.get("arxiv_id"),
         doi=fields.get("doi"),

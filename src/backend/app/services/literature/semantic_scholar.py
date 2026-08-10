@@ -17,7 +17,8 @@ from app.services.literature.cache import ResponseCache, TokenBucket, cache_key
 API_BASE = "https://api.semanticscholar.org/graph/v1"
 
 PAPER_FIELDS = (
-    "title,abstract,year,publicationDate,venue,externalIds,url,citationCount,tldr,authors"
+    "paperId,corpusId,title,abstract,year,publicationDate,venue,journal,publicationTypes,"
+    "externalIds,url,citationCount,tldr,authors,isOpenAccess,openAccessPdf"
 )
 # references/citations 端点不支持 tldr 字段（带上会 400）
 LINK_FIELDS = "title,abstract,year,publicationDate,venue,externalIds,url,citationCount,authors"

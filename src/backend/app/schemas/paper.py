@@ -168,18 +168,27 @@ class PaperListPage(BaseModel):
 
 
 class PaperManualCreate(BaseModel):
-    """手动添加文献：arxiv_id / doi / bibtex 三选一（docs/api-lit.md §4）。"""
+    """手动添加文献：arxiv_id / doi / corpus_id / bibtex 四选一。"""
 
     arxiv_id: str | None = None
     doi: str | None = None
+    corpus_id: str | None = None
     bibtex: str | None = None
 
     @model_validator(mode="after")
     def _exactly_one(self) -> "PaperManualCreate":
-        provided = [v for v in (self.arxiv_id, self.doi, self.bibtex) if v and v.strip()]
+        provided = [
+            v for v in (self.arxiv_id, self.doi, self.corpus_id, self.bibtex) if v and v.strip()
+        ]
         if len(provided) != 1:
-            raise ValueError("arxiv_id / doi / bibtex 必须且只能填一个")
+            raise ValueError("arxiv_id / doi / corpus_id / bibtex 必须且只能填一个")
         return self
+
+
+class PaperPdfUrlCreate(BaseModel):
+    """通过公开 URL 补录或替换论文 PDF。"""
+
+    url: str = Field(min_length=8, max_length=4096)
 
 
 class PaperBatchIds(BaseModel):

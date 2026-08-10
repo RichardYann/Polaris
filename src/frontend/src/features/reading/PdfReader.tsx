@@ -357,6 +357,43 @@ export function PdfReader({
     },
   });
 
+  const pdfFileInput = useRef<HTMLInputElement | null>(null);
+  const replacePdfMutation = useMutation({
+    mutationFn: (source: { file: File } | { url: string }) =>
+      'file' in source
+        ? api.uploadPaperPdf(paper.id, source.file)
+        : api.fetchPaperPdfUrl(paper.id, source.url),
+    onSuccess: (updated) => {
+      toast(
+        updated.task_id ? 'PDF 已保存，正在后台重建全文和图片' : 'PDF 已保存',
+        'ok',
+      );
+      void queryClient.invalidateQueries({ queryKey: ['paper-pdf', paper.id] });
+      void queryClient.invalidateQueries({ queryKey: ['paper'] });
+    },
+    onError: (e) =>
+      toast(`PDF 补录失败：${e instanceof Error ? e.message : String(e)}`, 'error'),
+  });
+
+  const submitPdfUrl = useCallback(() => {
+    const url = window.prompt('请输入可直接下载的 PDF 链接');
+    if (url?.trim()) replacePdfMutation.mutate({ url: url.trim() });
+  }, [replacePdfMutation]);
+
+  const uploadInput = (
+    <input
+      ref={pdfFileInput}
+      type="file"
+      accept="application/pdf,.pdf"
+      hidden
+      onChange={(e) => {
+        const file = e.target.files?.[0];
+        if (file) replacePdfMutation.mutate({ file });
+        e.currentTarget.value = '';
+      }}
+    />
+  );
+
   // —— 划词：mouseup 后读取选区，落到某一页并归一化 ——
   const captureSelection = useCallback(() => {
     const sel = window.getSelection();
@@ -483,10 +520,12 @@ export function PdfReader({
           desc={
             canFetch
               ? undefined
-              : '这篇论文不是 arXiv 来源，暂时不支持自动下载 PDF，可以通过右上角原文链接查看。'
+              : '可以上传本地 PDF，或提供可直接下载的 PDF 链接。'
           }
           action={
-            canFetch ? (
+            <div className="row gap8" style={{ justifyContent: 'center', flexWrap: 'wrap' }}>
+              {uploadInput}
+              {canFetch && (
               <button
                 className="btn btn-primary"
                 disabled={fetchPdfMutation.isPending}
@@ -504,18 +543,24 @@ export function PdfReader({
                   </>
                 )}
               </button>
-            ) : paper.url ? (
-              <a
+              )}
+              <button
+                className={canFetch ? 'btn btn-ghost' : 'btn btn-primary'}
+                disabled={replacePdfMutation.isPending}
+                onClick={() => pdfFileInput.current?.click()}
+              >
+                <Icon name="file" size={14} />
+                上传 PDF
+              </button>
+              <button
                 className="btn btn-ghost"
-                href={paper.url}
-                target="_blank"
-                rel="noreferrer noopener"
-                style={{ textDecoration: 'none' }}
+                disabled={replacePdfMutation.isPending}
+                onClick={submitPdfUrl}
               >
                 <Icon name="link" size={14} />
-                打开原文链接
-              </a>
-            ) : undefined
+                PDF 链接
+              </button>
+            </div>
           }
         />
       </div>
@@ -537,6 +582,22 @@ export function PdfReader({
           value={mode}
           onChange={setMode}
         />
+        {uploadInput}
+        <button
+          className="btn btn-ghost sm"
+          disabled={replacePdfMutation.isPending}
+          onClick={() => pdfFileInput.current?.click()}
+        >
+          替换 PDF
+        </button>
+        <button
+          className="icon-btn"
+          title="通过 PDF 链接替换"
+          disabled={replacePdfMutation.isPending}
+          onClick={submitPdfUrl}
+        >
+          <Icon name="link" size={14} />
+        </button>
         {mode === 'annotate' ? (
           <span className="row gap6" style={{ marginLeft: 'auto' }}>
             <button

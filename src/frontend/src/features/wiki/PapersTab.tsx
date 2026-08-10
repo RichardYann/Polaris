@@ -119,7 +119,7 @@ export interface PapersTabProps {
 
 /* ---------------- 添加文献 Modal ---------------- */
 
-type ImportMethod = 'arxiv' | 'doi' | 'bibtex';
+type ImportMethod = 'arxiv' | 'doi' | 'corpus' | 'bibtex';
 
 function AddPaperModal({
   pid,
@@ -140,6 +140,7 @@ function AddPaperModal({
   const [method, setMethod] = useState<ImportMethod>('arxiv');
   const [arxivId, setArxivId] = useState('');
   const [doi, setDoi] = useState('');
+  const [corpusId, setCorpusId] = useState('');
   const [bibtex, setBibtex] = useState('');
   const [parseError, setParseError] = useState<string | null>(null);
   // 手动添加后若后端返回 task_id，弹出分阶段处理进度
@@ -159,13 +160,18 @@ function AddPaperModal({
         ? doi.trim()
           ? { doi: doi.trim() }
           : null
-        : bibtex.trim()
-          ? { bibtex: bibtex.trim() }
-          : null;
+        : method === 'corpus'
+          ? corpusId.trim()
+            ? { corpus_id: corpusId.trim() }
+            : null
+          : bibtex.trim()
+            ? { bibtex: bibtex.trim() }
+            : null;
 
   const reset = () => {
     setArxivId('');
     setDoi('');
+    setCorpusId('');
     setBibtex('');
     setParseError(null);
   };
@@ -246,6 +252,7 @@ function AddPaperModal({
         options={[
           { v: 'arxiv', label: 'arXiv ID' },
           { v: 'doi', label: 'DOI' },
+          { v: 'corpus', label: 'Corpus ID' },
           { v: 'bibtex', label: tr('BibTeX 粘贴', 'Paste BibTeX') },
         ]}
         value={method}
@@ -283,6 +290,22 @@ function AddPaperModal({
             <div className="muted" style={{ fontSize: 11.5, marginTop: 8, lineHeight: 1.6 }}>
               {tr('适合期刊 / 会议论文。', 'Best for journal and conference papers.')}
             </div>
+          </>
+        ) : method === 'corpus' ? (
+          <>
+            <input
+              className="input mono"
+              style={{ width: '100%' }}
+              placeholder={tr(
+                '请输入 Semantic Scholar Corpus ID，例如 13756489',
+                'Semantic Scholar Corpus ID, e.g. 13756489',
+              )}
+              value={corpusId}
+              onChange={(e) => {
+                setCorpusId(e.target.value);
+                setParseError(null);
+              }}
+            />
           </>
         ) : (
           <>

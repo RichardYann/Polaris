@@ -560,9 +560,7 @@ async def list_library_papers(
     published_to: datetime | None = Query(default=None),
     created_from: datetime | None = Query(default=None),
     created_to: datetime | None = Query(default=None),
-    daily_only: bool = Query(
-        default=False, description="只看从每日论文池自动收录的"
-    ),
+    daily_only: bool = Query(default=False, description="只看从每日论文池自动收录的"),
     last_sync_only: bool = Query(
         default=False,
         description="只看最近一次同步新增的（没同步过则返回空；「最新收录」视图用）",
@@ -875,6 +873,7 @@ async def add_library_paper_manually(
             library=library,
             arxiv_id=data.arxiv_id,
             doi=data.doi,
+            corpus_id=data.corpus_id,
             bibtex=data.bibtex,
             project_id=library.project_id,
         )

@@ -16,7 +16,7 @@ import { PaperProgressModal } from './PaperProgressModal';
    不进任何公共文献库。需要下载/抽取时弹分阶段进度。
    ============================================================ */
 
-type AddMethod = 'ref' | 'bibtex';
+type AddMethod = 'ref' | 'corpus' | 'bibtex';
 
 export function AddToLibraryModal({
   open,
@@ -31,6 +31,7 @@ export function AddToLibraryModal({
   const queryClient = useQueryClient();
   const [method, setMethod] = useState<AddMethod>('ref');
   const [ref, setRef] = useState('');
+  const [corpusId, setCorpusId] = useState('');
   const [bibtex, setBibtex] = useState('');
   const [parseError, setParseError] = useState<string | null>(null);
   // 后端返回 task_id 时弹出分阶段处理进度（下载 / 抽取 / 向量化）
@@ -38,12 +39,21 @@ export function AddToLibraryModal({
 
   const reset = () => {
     setRef('');
+    setCorpusId('');
     setBibtex('');
     setParseError(null);
   };
 
   const input: PaperImportInput | null =
-    method === 'bibtex' ? (bibtex.trim() ? { bibtex: bibtex.trim() } : null) : parsePaperRef(ref);
+    method === 'bibtex'
+      ? bibtex.trim()
+        ? { bibtex: bibtex.trim() }
+        : null
+      : method === 'corpus'
+        ? corpusId.trim()
+          ? { corpus_id: corpusId.trim() }
+          : null
+        : parsePaperRef(ref);
 
   const importMutation = useMutation({
     mutationFn: (inp: PaperImportInput) => api.importToLibrary(inp),
@@ -120,6 +130,7 @@ export function AddToLibraryModal({
         <Segmented<AddMethod>
           options={[
             { v: 'ref', label: tr('arXiv 编号 / DOI', 'arXiv ID / DOI') },
+            { v: 'corpus', label: 'Corpus ID' },
             { v: 'bibtex', label: tr('粘贴 BibTeX', 'Paste BibTeX') },
           ]}
           value={method}
@@ -157,6 +168,26 @@ export function AddToLibraryModal({
                 )}
               </div>
             </>
+          ) : method === 'corpus' ? (
+            <input
+              className="input mono"
+              autoFocus
+              style={{ width: '100%' }}
+              placeholder={tr(
+                '请输入 Semantic Scholar Corpus ID，例如 13756489',
+                'Semantic Scholar Corpus ID, e.g. 13756489',
+              )}
+              value={corpusId}
+              onChange={(e) => {
+                setCorpusId(e.target.value);
+                setParseError(null);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && input && !importMutation.isPending) {
+                  importMutation.mutate(input);
+                }
+              }}
+            />
           ) : (
             <>
               <textarea

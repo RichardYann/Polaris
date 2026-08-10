@@ -30,6 +30,7 @@ from app.models.library_direction import LibraryPaper
 from app.models.paper import (
     Concept,
     Paper,
+    PaperChunk,
     PaperNote,
     PaperTag,
     PaperUserMeta,
@@ -967,15 +968,15 @@ async def fetch_pdf(
     - 下载失败 → PdfFetchFailedError（路由映射 502）
     - 全文抽取失败只记日志，不影响 PDF 落盘
     """
-    from app.services.literature import get_arxiv_client
     from app.services.literature.pdf_extract import extract_full_text, save_pdf
+    from app.services.literature.pdf_source import download_paper_pdf
 
     if paper.pdf_path and Path(paper.pdf_path).exists():
         return paper
-    if not paper.arxiv_id:
-        raise PdfSourceUnsupportedError("论文没有 arxiv 编号，暂不支持自动获取 PDF")
+    if not paper.arxiv_id and not (paper.external_ids or {}).get("pdf_url"):
+        raise PdfSourceUnsupportedError("论文没有可自动获取的 PDF 来源")
     try:
-        content = await get_arxiv_client().download_pdf(paper.arxiv_id)
+        content = await download_paper_pdf(paper)
     except asyncio.CancelledError:
         raise
     except Exception as e:
@@ -1043,6 +1044,22 @@ async def fetch_pdf(
     except Exception:  # noqa: BLE001
         logger.warning("chunk embed failed for paper %s", paper.id, exc_info=True)
     await session.refresh(paper)
+    return paper
+
+
+async def replace_pdf_content(session: AsyncSession, paper: Paper, content: bytes) -> Paper:
+    """Atomically install/replace a PDF and invalidate all PDF-derived artifacts."""
+    from app.services.literature.pdf_extract import figures_dir, papers_dir, save_pdf
+
+    txt_path = papers_dir() / f"{paper.id}.txt"
+    if txt_path.exists():
+        txt_path.unlink()
+    shutil.rmtree(figures_dir(str(paper.id)), ignore_errors=True)
+    await session.execute(delete(PaperChunk).where(PaperChunk.paper_id == paper.id))
+    paper.pdf_path = str(save_pdf(str(paper.id), content))
+    paper.full_text_path = None
+    paper.figures = None
+    await session.commit()
     return paper
 
 
