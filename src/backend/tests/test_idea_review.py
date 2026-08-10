@@ -9,6 +9,7 @@ import uuid
 from sqlalchemy import select
 
 from app.agents.voyage import VoyageEngine
+from app.agents.voyage.actions_ideas import _pair_group, _pair_key
 from app.core.db import get_sessionmaker
 from app.core.llm.fake import FakeProvider
 from app.core.llm.router import LLMRouter
@@ -17,6 +18,20 @@ from app.models.review import ReviewMessage, ReviewSession
 from tests.conftest import RecordingBus, register_and_login
 
 DEFAULT_PERSONA_NAMES = ["严谨方法论者", "务实工程师", "领域怀疑论者"]
+
+
+def test_swiss_pairing_uses_byes_instead_of_rematches():
+    group = ["a", "b", "c", "d"]
+    # Only a-d remains fresh. A complete two-match round is impossible, so the
+    # strict Swiss constraint should schedule one fresh match and two byes.
+    played = {
+        _pair_key(a, b): 1
+        for a, b in (("a", "b"), ("a", "c"), ("b", "c"), ("b", "d"), ("c", "d"))
+    }
+    pairs, byes = _pair_group(group, played, {"c": 1})
+    assert pairs == [["a", "d"]]
+    assert set(byes) == {"b", "c"}
+    assert all(_pair_key(a, b) not in played for a, b in pairs)
 
 
 async def _setup_project(client, email="alice@example.com", name="review-proj"):
@@ -70,6 +85,183 @@ async def test_tournament_fans_out_per_match_nodes(client, queue_stub):
     # 两场对局是相邻两个节点，match_index 递增
     match_steps = [s for s in detail["steps"] if s["action"] == "review.match"]
     assert [s["observation"]["match_index"] for s in match_steps] == [0, 1]
+
+
+async def test_tournament_reset_starts_new_pairing_cycle_and_excludes_trash(client, queue_stub):
+    project_id, headers = await _setup_project(client, name="pairing-regression")
+    visible_ids = [await _seed_idea(project_id, f"当前想法{i}") for i in range(4)]
+    trashed_ids = [await _seed_idea(project_id, f"回收站想法{i}") for i in range(2)]
+    for idea_id in trashed_ids:
+        resp = await client.delete(f"/api/ideas/{idea_id}", headers=headers)
+        assert resp.status_code == 204, resp.text
+
+    # Explicit selection must not provide a way to re-introduce a trashed idea.
+    resp = await client.post(
+        f"/api/projects/{project_id}/review/tournament",
+        json={"idea_ids": [visible_ids[0], trashed_ids[0]], "rounds": 1},
+        headers=headers,
+    )
+    assert resp.status_code == 400 and resp.json()["detail"] == "INVALID_IDEA_IDS"
+
+    # Automatic selection sees only the four current ideas, hence two matches.
+    resp = await client.post(
+        f"/api/projects/{project_id}/review/tournament", json={"rounds": 1}, headers=headers
+    )
+    assert resp.status_code == 201, resp.text
+    engine, _ = _make_engine()
+    await engine.run(uuid.UUID(resp.json()["id"]))
+    detail = (await client.get(f"/api/voyages/{resp.json()['id']}", headers=headers)).json()
+    pair_observation = next(
+        s["observation"] for s in detail["steps"] if s["action"] == "review.pair"
+    )
+    assert pair_observation["participants"] == 4
+    assert pair_observation["pairs"] == 2
+    assert pair_observation["repeated_pairs"] == 0
+
+    # Reset starts a new rating and pairing cycle. Older matches remain visible as
+    # history, but must no longer block the same opponents from meeting again.
+    resp = await client.post(
+        f"/api/projects/{project_id}/review/ratings/reset", headers=headers
+    )
+    assert resp.status_code == 200 and resp.json()["affected"] == 4
+    async with get_sessionmaker()() as session:
+        visible = [await session.get(Idea, uuid.UUID(idea_id)) for idea_id in visible_ids]
+        assert all(
+            i is not None and i.elo_rating == 1200 and i.matches == 0 and i.wins == 0
+            for i in visible
+        )
+
+    resp = await client.post(
+        f"/api/projects/{project_id}/review/tournament", json={"rounds": 1}, headers=headers
+    )
+    assert resp.status_code == 201, resp.text
+    await engine.run(uuid.UUID(resp.json()["id"]))
+    detail = (await client.get(f"/api/voyages/{resp.json()['id']}", headers=headers)).json()
+    pair_observation = next(
+        s["observation"] for s in detail["steps"] if s["action"] == "review.pair"
+    )
+    assert pair_observation["fresh_pairs"] == 2
+    assert pair_observation["repeated_pairs"] == 0
+
+    async with get_sessionmaker()() as session:
+        matches = list(
+            (
+                await session.execute(
+                    select(ReviewSession)
+                    .where(ReviewSession.target_type == "idea_match")
+                    .order_by(ReviewSession.created_at)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    pair_sets = [frozenset((m.payload["idea_a"], m.payload["idea_b"])) for m in matches]
+    assert len(pair_sets) == 4
+    assert set(pair_sets[:2]) == set(pair_sets[2:])
+
+    # Within the new cycle, however, the immediately preceding opponents are still
+    # excluded and Swiss pairing must find the two fresh alternatives.
+    resp = await client.post(
+        f"/api/projects/{project_id}/review/tournament", json={"rounds": 1}, headers=headers
+    )
+    assert resp.status_code == 201, resp.text
+    await engine.run(uuid.UUID(resp.json()["id"]))
+    async with get_sessionmaker()() as session:
+        matches = list(
+            (
+                await session.execute(
+                    select(ReviewSession)
+                    .where(ReviewSession.target_type == "idea_match")
+                    .order_by(ReviewSession.created_at)
+                )
+            )
+            .scalars()
+            .all()
+        )
+    pair_sets = [frozenset((m.payload["idea_a"], m.payload["idea_b"])) for m in matches]
+    assert len(pair_sets) == 6
+    assert set(pair_sets[2:4]).isdisjoint(pair_sets[4:])
+
+
+class _FailOnePairProvider(FakeProvider):
+    async def complete(self, messages, *, model, temperature=0.7, max_tokens=None):
+        if any("FAIL_PAIR" in message.content for message in messages):
+            raise RuntimeError("temporary upstream failure")
+        return await super().complete(
+            messages, model=model, temperature=temperature, max_tokens=max_tokens
+        )
+
+
+async def test_partial_tournament_retry_and_undo_latest_round(client, queue_stub):
+    project_id, headers = await _setup_project(client, name="retry-and-undo")
+    idea_ids = [
+        await _seed_idea(project_id, "想法 A"),
+        await _seed_idea(project_id, "想法 B"),
+        await _seed_idea(project_id, "FAIL_PAIR 想法 C"),
+        await _seed_idea(project_id, "FAIL_PAIR 想法 D"),
+    ]
+    resp = await client.post(
+        f"/api/projects/{project_id}/review/tournament", json={"rounds": 1}, headers=headers
+    )
+    assert resp.status_code == 201, resp.text
+    router = LLMRouter()
+    router.override_provider(_FailOnePairProvider())
+    engine = VoyageEngine(event_bus=RecordingBus(), llm_router=router)
+    await engine.run(uuid.UUID(resp.json()["id"]))
+
+    summary = (
+        await client.get(
+            f"/api/projects/{project_id}/review/tournament/latest", headers=headers
+        )
+    ).json()
+    assert summary["planned"] == 2
+    assert summary["completed"] == 1
+    assert summary["failed"] == 1
+    assert summary["can_retry"] is True
+
+    retry = await client.post(
+        f"/api/projects/{project_id}/review/tournament/retry-failed", headers=headers
+    )
+    assert retry.status_code == 201, retry.text
+    retry_id = retry.json()["id"]
+    retry_engine, _ = _make_engine()
+    await retry_engine.run(uuid.UUID(retry_id))
+
+    summary = (
+        await client.get(
+            f"/api/projects/{project_id}/review/tournament/latest", headers=headers
+        )
+    ).json()
+    assert summary["is_retry"] is True
+    assert summary["completed"] == 1 and summary["failed"] == 0
+    assert summary["can_undo"] is True
+
+    undo = await client.post(
+        f"/api/projects/{project_id}/review/tournament/undo-latest", headers=headers
+    )
+    assert undo.status_code == 200, undo.text
+    assert undo.json()["affected"] == 3  # success + failed/open + successful retry
+
+    async with get_sessionmaker()() as session:
+        ideas = [await session.get(Idea, uuid.UUID(idea_id)) for idea_id in idea_ids]
+        assert all(
+            idea is not None
+            and idea.elo_rating == 1200
+            and idea.matches == 0
+            and idea.wins == 0
+            and idea.status == "candidate"
+            for idea in ideas
+        )
+        sessions = list(
+            (
+                await session.execute(
+                    select(ReviewSession).where(ReviewSession.target_type == "idea_match")
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert sessions == []
 
 
 async def test_tournament_debate_elo_and_leaderboard(client, queue_stub):

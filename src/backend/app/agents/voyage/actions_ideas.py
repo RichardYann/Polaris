@@ -19,6 +19,7 @@ import math
 import re
 import uuid
 from datetime import timedelta
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,7 @@ from app.models.library_direction import LibraryPaper
 from app.models.paper import Concept, Paper, PaperWiki, paper_concepts
 from app.models.project import Project
 from app.models.review import ReviewMessage, ReviewSession
+from app.models.voyage import VoyageRun
 from app.schemas.idea import FORGE_SIGNALS
 from app.services.concepts import library_concept_ids
 from app.services.embedding import embed_documents, idea_vectors, upsert_idea_vector
@@ -908,14 +910,158 @@ def _rounds(ctx: ActionContext) -> int:
         return DEFAULT_ROUNDS
 
 
+def _pair_key(idea_a: str, idea_b: str) -> tuple[str, str]:
+    return (idea_a, idea_b) if idea_a < idea_b else (idea_b, idea_a)
+
+
+def _pair_group(
+    group: list[str],
+    encounter_counts: dict[tuple[str, str], int],
+    bye_counts: dict[str, int],
+) -> tuple[list[list[str]], list[str]]:
+    """Swiss-pair one depth group without rematches.
+
+    The optimizer first minimizes byes, then avoids repeat byes, then keeps Elo ranks
+    close. If no complete fresh matching exists it creates additional byes instead of
+    silently scheduling a rematch.
+    """
+    if len(group) < 2:
+        return [], list(group)
+
+    ranks = {idea_id: rank for rank, idea_id in enumerate(group)}
+
+    if len(group) > 20:
+        remaining = list(group)
+        pairs: list[list[str]] = []
+        byes: list[str] = []
+        while remaining:
+            idea_a = remaining.pop(0)
+            fresh = [
+                idx
+                for idx, idea_b in enumerate(remaining)
+                if encounter_counts.get(_pair_key(idea_a, idea_b), 0) == 0
+            ]
+            if not fresh:
+                byes.append(idea_a)
+                continue
+            opponent_idx = min(
+                fresh,
+                key=lambda idx: (abs(ranks[idea_a] - ranks[remaining[idx]]), idx),
+            )
+            pairs.append([idea_a, remaining.pop(opponent_idx)])
+        return pairs, byes
+
+    @cache
+    def solve(
+        mask: int,
+    ) -> tuple[tuple[int, int, int, int], tuple[tuple[str, str], ...], tuple[str, ...]]:
+        if mask == 0:
+            return (0, 0, 0, 0), (), ()
+        first_bit = mask & -mask
+        first_idx = first_bit.bit_length() - 1
+        first_id = group[first_idx]
+        rest = mask ^ first_bit
+
+        tail_cost, tail_pairs, tail_byes = solve(rest)
+        # A lower-ranked participant is the preferred bye when prior bye counts tie.
+        best: tuple[
+            tuple[int, int, int, int], tuple[tuple[str, str], ...], tuple[str, ...]
+        ] = (
+            (
+                tail_cost[0] + 1,
+                tail_cost[1] + bye_counts.get(first_id, 0),
+                tail_cost[2] + len(group) - 1 - first_idx,
+                tail_cost[3],
+            ),
+            tail_pairs,
+            (first_id, *tail_byes),
+        )
+
+        candidates = rest
+        while candidates:
+            opponent_bit = candidates & -candidates
+            opponent_idx = opponent_bit.bit_length() - 1
+            opponent_id = group[opponent_idx]
+            if encounter_counts.get(_pair_key(first_id, opponent_id), 0):
+                candidates ^= opponent_bit
+                continue
+            tail_cost, tail_pairs, tail_byes = solve(rest ^ opponent_bit)
+            total_cost = (
+                tail_cost[0],
+                tail_cost[1],
+                tail_cost[2],
+                tail_cost[3] + abs(first_idx - opponent_idx),
+            )
+            candidate = (
+                total_cost,
+                ((first_id, opponent_id), *tail_pairs),
+                tail_byes,
+            )
+            if candidate < best:
+                best = candidate
+            candidates ^= opponent_bit
+        return best
+
+    full_mask = (1 << len(group)) - 1
+    _cost, result_pairs, result_byes = solve(full_mask)
+    return [list(pair) for pair in result_pairs], list(result_byes)
+
+
 @register("review.pair")
 async def review_pair(ctx: ActionContext, params: dict[str, Any]) -> dict[str, Any]:
     if isinstance(ctx.checkpoint.get("review_pairs"), list):  # 断点幂等
         return {"pairs": len(ctx.checkpoint["review_pairs"]), "skipped": True}
     explicit_ids = _params(ctx).get("idea_ids")
+    retry_pairs = _params(ctx).get("retry_pairs")
 
     async with get_sessionmaker()() as session:
-        stmt = select(Idea).where(Idea.project_id == ctx.run.project_id)
+        if isinstance(retry_pairs, list):
+            pairs = [
+                [str(pair[0]), str(pair[1])]
+                for pair in retry_pairs
+                if isinstance(pair, list) and len(pair) == 2
+            ]
+            participant_ids = {idea_id for pair in pairs for idea_id in pair}
+            ideas = list(
+                (
+                    await session.execute(
+                        select(Idea).where(
+                            Idea.project_id == ctx.run.project_id,
+                            Idea.id.in_([uuid.UUID(i) for i in participant_ids]),
+                            Idea.trashed_at.is_(None),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if {str(i.id) for i in ideas} != participant_ids:
+                raise ValueError("retry participant missing or trashed")
+            ctx.checkpoint["review_pairs"] = pairs
+            ctx.checkpoint["review_byes"] = []
+            ctx.checkpoint["review_standings_before"] = {
+                str(i.id): {
+                    "elo_rating": i.elo_rating,
+                    "matches": i.matches,
+                    "wins": i.wins,
+                    "status": i.status,
+                }
+                for i in ideas
+            }
+            return {
+                "participants": len(participant_ids),
+                "pairs": len(pairs),
+                "fresh_pairs": len(pairs),
+                "repeated_pairs": 0,
+                "bye": None,
+                "retry": True,
+                "plan_signal": {"decision": "matches", "count": len(pairs)},
+            }
+
+        stmt = select(Idea).where(
+            Idea.project_id == ctx.run.project_id,
+            Idea.trashed_at.is_(None),
+        )
         if explicit_ids:
             stmt = stmt.where(Idea.id.in_([uuid.UUID(str(i)) for i in explicit_ids]))
         else:
@@ -934,20 +1080,84 @@ async def review_pair(ctx: ActionContext, params: dict[str, Any]) -> dict[str, A
                 {"type": "idea.status", "idea_id": str(idea.id), "status": idea.status}
             )
         ordered = [(str(i.id), i.depth) for i in ideas]
+        ctx.checkpoint["review_standings_before"] = {
+            str(i.id): {
+                "elo_rating": i.elo_rating,
+                "matches": i.matches,
+                "wins": i.wins,
+                "status": "candidate" if i in status_changed else i.status,
+            }
+            for i in ideas
+        }
+
+        participant_ids = {idea_id for idea_id, _depth in ordered}
+        reset_at = (
+            await session.execute(
+                select(Activity.created_at)
+                .where(
+                    Activity.project_id == ctx.run.project_id,
+                    Activity.kind == "review.ratings_reset",
+                )
+                .order_by(Activity.created_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        history_stmt = (
+            select(ReviewSession.payload)
+            .join(Idea, Idea.id == ReviewSession.target_id)
+            .where(
+                Idea.project_id == ctx.run.project_id,
+                ReviewSession.target_type == "idea_match",
+                ReviewSession.status == "closed",
+            )
+        )
+        if reset_at is not None:
+            history_stmt = history_stmt.where(ReviewSession.created_at > reset_at)
+        encounter_counts: dict[tuple[str, str], int] = {}
+        for (payload,) in (await session.execute(history_stmt)).all():
+            if not isinstance(payload, dict):
+                continue
+            idea_a = str(payload.get("idea_a") or "")
+            idea_b = str(payload.get("idea_b") or "")
+            if idea_a in participant_ids and idea_b in participant_ids and idea_a != idea_b:
+                key = _pair_key(idea_a, idea_b)
+                encounter_counts[key] = encounter_counts.get(key, 0) + 1
+
+        bye_counts: dict[str, int] = {}
+        bye_history_stmt = select(VoyageRun.checkpoint).where(
+            VoyageRun.project_id == ctx.run.project_id,
+            VoyageRun.kind == "idea_review",
+            VoyageRun.id != ctx.run.id,
+        )
+        if reset_at is not None:
+            bye_history_stmt = bye_history_stmt.where(VoyageRun.created_at > reset_at)
+        for (checkpoint,) in (await session.execute(bye_history_stmt)).all():
+            if not isinstance(checkpoint, dict):
+                continue
+            historical_byes = checkpoint.get("review_byes")
+            if not isinstance(historical_byes, list):
+                continue
+            for idea_id in historical_byes:
+                idea_id = str(idea_id)
+                if idea_id in participant_ids:
+                    bye_counts[idea_id] = bye_counts.get(idea_id, 0) + 1
 
     # 同 depth 才配对（sketch 对 sketch、proposal 对 proposal，docs/api-idea2.md §7）
     pairs: list[list[str]] = []
     byes: list[str] = []
     for depth in ("proposal", "sketch"):
         group = [idea_id for idea_id, d in ordered if d == depth]
-        pairs.extend([group[i], group[i + 1]] for i in range(0, len(group) - 1, 2))
-        if len(group) % 2 == 1:
-            byes.append(group[-1])
+        group_pairs, group_byes = _pair_group(group, encounter_counts, bye_counts)
+        pairs.extend(group_pairs)
+        byes.extend(group_byes)
     ctx.checkpoint["review_pairs"] = pairs
+    ctx.checkpoint["review_byes"] = byes
     # 配对数决定对局数：信号表据此把辩论展开成 N 个 review.match 节点（引擎可逐场查预算）
     return {
         "participants": len(ordered),
         "pairs": len(pairs),
+        "fresh_pairs": len(pairs),
+        "repeated_pairs": 0,
         "bye": byes or None,
         "plan_signal": {"decision": "matches", "count": len(pairs)},
     }
@@ -1026,7 +1236,12 @@ async def _run_match(
     review_session = ReviewSession(
         target_type="idea_match",
         target_id=idea_a.id,
-        payload={"idea_a": str(idea_a.id), "idea_b": str(idea_b.id), "round": match_no},
+        payload={
+            "idea_a": str(idea_a.id),
+            "idea_b": str(idea_b.id),
+            "round": match_no,
+            "voyage_id": str(ctx.run.id),
+        },
     )
     session.add(review_session)
     await session.commit()
@@ -1186,15 +1401,43 @@ async def review_match(ctx: ActionContext, params: dict[str, Any]) -> dict[str, 
 @register("review.summarize")
 async def review_summarize(ctx: ActionContext, params: dict[str, Any]) -> dict[str, Any]:
     results: list[dict[str, Any]] = list(ctx.checkpoint.get("review_results") or [])
+    planned_pairs: list[list[str]] = list(ctx.checkpoint.get("review_pairs") or [])
+    completed = {
+        _pair_key(str(result["idea_a"]), str(result["idea_b"]))
+        for result in results
+        if result.get("idea_a") and result.get("idea_b")
+    }
+    failed_pairs = [
+        pair
+        for pair in planned_pairs
+        if _pair_key(str(pair[0]), str(pair[1])) not in completed
+    ]
+    ctx.checkpoint["review_failed_pairs"] = failed_pairs
     async with get_sessionmaker()() as session:
         session.add(
             Activity(
                 project_id=ctx.run.project_id,
                 actor="agent:idea-review",
                 kind="review.completed",
-                message=f"Idea 评审锦标赛完成：{len(results)} 场辩论",
-                payload={"voyage_id": str(ctx.run.id), "matches": len(results)},
+                message=(
+                    f"Idea 评审锦标赛完成：{len(results)}/{len(planned_pairs)} 场成功"
+                    if failed_pairs
+                    else f"Idea 评审锦标赛完成：{len(results)} 场辩论"
+                ),
+                payload={
+                    "voyage_id": str(ctx.run.id),
+                    "matches": len(results),
+                    "planned": len(planned_pairs),
+                    "failed": len(failed_pairs),
+                },
             )
         )
         await session.commit()
-    return {"matches": len(results), "results": results}
+    return {
+        "matches": len(results),
+        "planned": len(planned_pairs),
+        "failed": len(failed_pairs),
+        "partial": bool(failed_pairs),
+        "failed_pairs": failed_pairs,
+        "results": results,
+    }

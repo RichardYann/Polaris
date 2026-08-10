@@ -9,6 +9,7 @@ import { Modal } from '../../components/ui/Modal';
 import { KnobRange } from '../../components/ui/KnobRange';
 import { FormField } from '../../components/ui/FormField';
 import { EmptyState } from '../../components/ui/EmptyState';
+import { ConfirmModal } from '../../components/ui/ConfirmModal';
 import { toast } from '../../components/ui/Toast';
 import { topicPath, useProject } from '../../app/project';
 import { fmtTime } from '../../lib/format';
@@ -539,6 +540,7 @@ function MatchesTab({
 
 export function ReviewPage() {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
   const { isLoading: projectsLoading, currentProject, currentProjectId } = useProject();
   const pid = currentProjectId;
@@ -546,6 +548,8 @@ export function ReviewPage() {
   const tab: ReviewTab = searchParams.get('tab') === 'matches' ? 'matches' : 'leaderboard';
   const focusIdea = searchParams.get('idea');
   const [modalOpen, setModalOpen] = useState(false);
+  const [resetConfirmOpen, setResetConfirmOpen] = useState(false);
+  const [undoConfirmOpen, setUndoConfirmOpen] = useState(false);
 
   function setTab(t: ReviewTab) {
     setSearchParams(
@@ -580,6 +584,15 @@ export function ReviewPage() {
   });
   const rows = leaderboardQuery.data ?? [];
 
+  const tournamentQuery = useQuery({
+    queryKey: ['latest-tournament', pid],
+    queryFn: () => api.getLatestTournamentSummary(pid!),
+    enabled: !!pid,
+    retry: false,
+    refetchInterval: runningVoyage ? 5_000 : false,
+  });
+  const latestTournament = tournamentQuery.data ?? null;
+
   // 晋级按钮 owner 可见：项目 owner 或平台 admin；成员信息缺失时放行（后端仍会校验）
   const { data: me } = useQuery({ queryKey: ['me'], queryFn: () => api.me(), retry: false, staleTime: 60_000 });
   const members = currentProject?.members;
@@ -587,6 +600,53 @@ export function ReviewPage() {
     isAdmin(me) ||
     !members ||
     members.some((m) => m.role === 'owner' && ((me?.id && m.user_id === me.id) || (me?.email && m.email === me.email)));
+
+  const resetMutation = useMutation({
+    mutationFn: () => api.resetTournamentRatings(pid!),
+    onSuccess: ({ affected }) => {
+      setResetConfirmOpen(false);
+      toast(
+        tr(
+          `已重置 ${affected} 个当前想法的锦标赛评分`,
+          `Reset tournament ratings for ${affected} current ideas`,
+        ),
+        'ok',
+      );
+      void leaderboardQuery.refetch();
+      void queryClient.invalidateQueries({ queryKey: ['ideas'] });
+    },
+    onError: (e) => {
+      if (e instanceof ApiError && e.status === 409) {
+        toast(tr('有 forge/review 任务正在运行，暂时不能重置评分。', 'A forge/review task is running; ratings cannot be reset yet.'), 'error');
+      } else {
+        toast(`${tr('重置失败', 'Reset failed')}：${e instanceof Error ? e.message : String(e)}`, 'error');
+      }
+    },
+  });
+
+  const retryMutation = useMutation({
+    mutationFn: () => api.retryFailedTournamentMatches(pid!),
+    onSuccess: (voyage) => {
+      toast(tr('失败对局补赛已开始', 'Failed-match retry started'), 'ok');
+      void queryClient.invalidateQueries({ queryKey: ['latest-tournament', pid] });
+      void queryClient.invalidateQueries({ queryKey: ['forge-state', pid] });
+      navigate(`/voyages/${voyage.id}`);
+    },
+    onError: (e) => toast(`${tr('补赛启动失败', 'Failed to start retry')}：${e instanceof Error ? e.message : String(e)}`, 'error'),
+  });
+
+  const undoMutation = useMutation({
+    mutationFn: () => api.undoLatestTournament(pid!),
+    onSuccess: ({ affected }) => {
+      setUndoConfirmOpen(false);
+      toast(tr(`已撤销最新一轮并删除 ${affected} 场辩论记录`, `Latest round undone; removed ${affected} debate records`), 'ok');
+      void leaderboardQuery.refetch();
+      void queryClient.invalidateQueries({ queryKey: ['latest-tournament', pid] });
+      void queryClient.invalidateQueries({ queryKey: ['idea-sessions'] });
+      void queryClient.invalidateQueries({ queryKey: ['ideas'] });
+    },
+    onError: (e) => toast(`${tr('撤销失败', 'Undo failed')}：${e instanceof Error ? e.message : String(e)}`, 'error'),
+  });
 
   return (
     <div className="page fadeup" style={{ maxWidth: 1280 }}>
@@ -624,6 +684,31 @@ export function ReviewPage() {
         </div>
       )}
 
+      {!runningVoyage && latestTournament && latestTournament.failed > 0 && !latestTournament.undone && (
+        <div className="card card-pad" style={{ marginBottom: 16, borderColor: 'var(--warn)', background: 'var(--warn-bg)' }}>
+          <div className="row gap10">
+            <Icon name="x" size={15} style={{ color: 'var(--warn)' }} />
+            <span style={{ fontSize: 13, fontWeight: 650 }}>
+              {tr(
+                `最新一轮部分完成：成功 ${latestTournament.completed}/${latestTournament.planned}，${latestTournament.failed} 场待补赛`,
+                `Latest round partially completed: ${latestTournament.completed}/${latestTournament.planned} succeeded; ${latestTournament.failed} need retry`,
+              )}
+            </span>
+            {latestTournament.can_retry && (
+              <button
+                className="btn btn-soft sm"
+                style={{ marginLeft: 'auto' }}
+                disabled={retryMutation.isPending}
+                onClick={() => retryMutation.mutate()}
+              >
+                <Icon name="refresh" size={13} />
+                {tr(`补跑失败对局（${latestTournament.failed}）`, `Retry failed matches (${latestTournament.failed})`)}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       <div className="row page-tabs" style={{ marginBottom: 14, justifyContent: 'space-between' }}>
         <Segmented<ReviewTab>
           options={[
@@ -633,19 +718,42 @@ export function ReviewPage() {
           value={tab}
           onChange={setTab}
         />
+        <div className="row gap8">
+          {canPromote && latestTournament?.can_undo && (
+            <button
+              className="btn btn-ghost sm"
+              disabled={!!runningVoyage || undoMutation.isPending}
+              onClick={() => setUndoConfirmOpen(true)}
+              style={{ color: 'var(--danger)' }}
+            >
+              <Icon name="refresh" size={13} />
+              {tr('撤销最新一轮', 'Undo latest round')}
+            </button>
+          )}
+          {canPromote && (
+            <button
+              className="btn btn-ghost sm"
+              disabled={!pid || !!runningVoyage || rows.length === 0 || resetMutation.isPending}
+              onClick={() => setResetConfirmOpen(true)}
+            >
+              <Icon name="refresh" size={13} />
+              {tr('重置评分', 'Reset ratings')}
+            </button>
+          )}
           <button className="btn btn-primary sm" disabled={!pid || !!runningVoyage} onClick={() => setModalOpen(true)}>
-            {runningVoyage ? (
-              <>
-                <Icon name="refresh" size={13} style={{ animation: 'spin 1s linear infinite' }} />
-                {tr('运行中…', 'Running…')}
-              </>
-            ) : (
-              <>
-                <Icon name="play" size={13} />
-                {tr('运行锦标赛', 'Run tournament')}
-              </>
-            )}
-          </button>
+              {runningVoyage ? (
+                <>
+                  <Icon name="refresh" size={13} style={{ animation: 'spin 1s linear infinite' }} />
+                  {tr('运行中…', 'Running…')}
+                </>
+              ) : (
+                <>
+                  <Icon name="play" size={13} />
+                  {tr('运行锦标赛', 'Run tournament')}
+                </>
+              )}
+            </button>
+        </div>
       </div>
 
       <div className="card" style={{ overflow: 'hidden', minHeight: 320 }}>
@@ -675,6 +783,32 @@ export function ReviewPage() {
       </div>
 
       {pid && <TournamentModal open={modalOpen} onClose={() => setModalOpen(false)} pid={pid} />}
+      <ConfirmModal
+        open={resetConfirmOpen}
+        onClose={() => setResetConfirmOpen(false)}
+        title={tr('重置锦标赛评分', 'Reset tournament ratings')}
+        message={tr(
+          `将把排行榜中 ${rows.length} 个当前想法的 Elo 恢复为 1200，并把对局数和胜场清零。回收站想法与历史辩论记录不会改变。`,
+          `This resets Elo to 1200 and clears matches and wins for the ${rows.length} current ideas. Trashed ideas and debate history are preserved.`,
+        )}
+        confirmText={tr('确认重置', 'Reset ratings')}
+        danger
+        busy={resetMutation.isPending}
+        onConfirm={() => resetMutation.mutate()}
+      />
+      <ConfirmModal
+        open={undoConfirmOpen}
+        onClose={() => setUndoConfirmOpen(false)}
+        title={tr('撤销最新一轮锦标赛', 'Undo latest tournament round')}
+        message={tr(
+          '将恢复该轮开始前的 Elo、对局数、胜场和想法状态，并删除该轮及其补赛产生的辩论会话与消息。任务审计和 token 用量记录会保留。',
+          'This restores pre-round Elo, matches, wins and idea status, and deletes debate sessions/messages from the round and its retries. Task audit and token usage are preserved.',
+        )}
+        confirmText={tr('确认撤销', 'Undo round')}
+        danger
+        busy={undoMutation.isPending}
+        onConfirm={() => undoMutation.mutate()}
+      />
     </div>
   );
 }

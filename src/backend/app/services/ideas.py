@@ -14,6 +14,7 @@ from app.models.idea import IDEA_STATUSES, Idea
 from app.models.library_direction import LibraryPaper
 from app.models.paper import Concept, Paper, paper_concepts
 from app.models.project import Project, ProjectMember
+from app.models.review import ReviewSession
 from app.models.user import User
 from app.models.voyage import TERMINAL_STATUSES, VoyageRun
 from app.schemas.idea import DeepIdeaRequest, ForgeKnobs
@@ -63,6 +64,14 @@ class InvalidIdeaIdsError(Exception):
 
 class InvalidSeedError(Exception):
     """深耕种子引用的 concept/paper/idea 不存在或不属于本项目。"""
+
+
+class TournamentRetryUnavailableError(Exception):
+    """The latest tournament is running, fully successful, or already undone."""
+
+
+class TournamentUndoUnavailableError(Exception):
+    """The latest tournament cannot be safely undone."""
 
 
 # ---- voyage 创建 ----
@@ -149,12 +158,17 @@ async def create_tournament_voyage(
     created_by: uuid.UUID | None,
 ) -> VoyageRun:
     """建 idea_review（辩论锦标赛）voyage；参与者不足 2 个抛 NotEnoughIdeasError。"""
+    await _lock_project_idea_creation(session, project.id)
     if await find_running_idea_voyage(session, project.id) is not None:
         raise IdeaVoyageConflictError(str(project.id))
 
     if data.idea_ids:
         wanted = list(dict.fromkeys(data.idea_ids))
-        stmt = select(Idea.id).where(Idea.project_id == project.id, Idea.id.in_(wanted))
+        stmt = select(Idea.id).where(
+            Idea.project_id == project.id,
+            Idea.id.in_(wanted),
+            Idea.trashed_at.is_(None),
+        )
         found = {row for (row,) in (await session.execute(stmt)).all()}
         missing = [str(i) for i in wanted if i not in found]
         if missing:
@@ -162,7 +176,9 @@ async def create_tournament_voyage(
         participant_count = len(wanted)
     else:
         stmt = select(func.count()).where(
-            Idea.project_id == project.id, Idea.status.in_(("candidate", "under_review"))
+            Idea.project_id == project.id,
+            Idea.status.in_(("candidate", "under_review")),
+            Idea.trashed_at.is_(None),
         )
         participant_count = int((await session.execute(stmt)).scalar_one())
     if participant_count < 2:
@@ -197,6 +213,322 @@ async def create_tournament_voyage(
     await session.commit()
     await session.refresh(run)
     return run
+
+
+async def reset_tournament_ratings(
+    session: AsyncSession,
+    *,
+    project: Project,
+    created_by: uuid.UUID | None,
+) -> int:
+    """Reset Elo and win/loss counters for all non-trashed ideas in a project."""
+    await _lock_project_idea_creation(session, project.id)
+    if await find_running_idea_voyage(session, project.id) is not None:
+        raise IdeaVoyageConflictError(str(project.id))
+
+    ideas = list(
+        (
+            await session.execute(
+                select(Idea).where(
+                    Idea.project_id == project.id,
+                    Idea.trashed_at.is_(None),
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    for idea in ideas:
+        idea.elo_rating = 1200.0
+        idea.matches = 0
+        idea.wins = 0
+    session.add(
+        Activity(
+            project_id=project.id,
+            actor=f"user:{created_by}" if created_by else "system",
+            kind="review.ratings_reset",
+            message=f"Idea 锦标赛评分已重置（{len(ideas)} 个当前想法）",
+            payload={"affected": len(ideas), "scope": "active"},
+        )
+    )
+    await session.commit()
+    return len(ideas)
+
+
+def _review_pair_key(idea_a: str, idea_b: str) -> tuple[str, str]:
+    return (idea_a, idea_b) if idea_a < idea_b else (idea_b, idea_a)
+
+
+def _failed_review_pairs(run: VoyageRun) -> list[list[str]]:
+    checkpoint = run.checkpoint or {}
+    planned = checkpoint.get("review_pairs") or []
+    results = checkpoint.get("review_results") or []
+    completed = {
+        _review_pair_key(str(r.get("idea_a")), str(r.get("idea_b")))
+        for r in results
+        if isinstance(r, dict) and r.get("idea_a") and r.get("idea_b")
+    }
+    return [
+        [str(pair[0]), str(pair[1])]
+        for pair in planned
+        if isinstance(pair, list)
+        and len(pair) == 2
+        and _review_pair_key(str(pair[0]), str(pair[1])) not in completed
+    ]
+
+
+async def latest_review_tournament(
+    session: AsyncSession, project_id: uuid.UUID
+) -> VoyageRun | None:
+    stmt = (
+        select(VoyageRun)
+        .where(VoyageRun.project_id == project_id, VoyageRun.kind == "idea_review")
+        .order_by(VoyageRun.created_at.desc())
+        .limit(1)
+    )
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+def review_tournament_summary(run: VoyageRun | None) -> dict[str, Any] | None:
+    if run is None:
+        return None
+    checkpoint = run.checkpoint or {}
+    planned = checkpoint.get("review_pairs") or []
+    results = checkpoint.get("review_results") or []
+    failed = _failed_review_pairs(run)
+    undone = bool(checkpoint.get("review_undone_at"))
+    params = checkpoint.get("params") or {}
+    return {
+        "voyage_id": str(run.id),
+        "root_voyage_id": str(params.get("retry_of") or run.id),
+        "status": run.status,
+        "planned": len(planned),
+        "completed": len(results),
+        "failed": len(failed),
+        "is_retry": bool(params.get("retry_of")),
+        "undone": undone,
+        "can_retry": run.status in TERMINAL_STATUSES and bool(failed) and not undone,
+        "can_undo": run.status in TERMINAL_STATUSES and not undone,
+    }
+
+
+async def create_retry_tournament_voyage(
+    session: AsyncSession,
+    *,
+    project: Project,
+    source: VoyageRun,
+    created_by: uuid.UUID | None,
+) -> VoyageRun:
+    """Create a supplement run containing only the source run's unfinished pairs."""
+    await _lock_project_idea_creation(session, project.id)
+    if await find_running_idea_voyage(session, project.id) is not None:
+        raise IdeaVoyageConflictError(str(project.id))
+    if source.project_id != project.id or source.kind != "idea_review":
+        raise TournamentRetryUnavailableError(str(source.id))
+    if source.status not in TERMINAL_STATUSES or (source.checkpoint or {}).get("review_undone_at"):
+        raise TournamentRetryUnavailableError(str(source.id))
+    failed_pairs = _failed_review_pairs(source)
+    if not failed_pairs:
+        raise TournamentRetryUnavailableError(str(source.id))
+
+    source_params = (source.checkpoint or {}).get("params") or {}
+    root_id = str(source_params.get("retry_of") or source.id)
+    params = {
+        "idea_ids": sorted({idea_id for pair in failed_pairs for idea_id in pair}),
+        "rounds": int(source_params.get("rounds") or 2),
+        "personas": source_params.get("personas"),
+        "retry_pairs": failed_pairs,
+        "retry_of": root_id,
+        "retry_source": str(source.id),
+    }
+    matches = len(failed_pairs)
+    run = VoyageRun(
+        kind="idea_review",
+        goal=f"Idea 评审锦标赛补赛：{project.name}",
+        status="planning",
+        cursor=0,
+        checkpoint={"params": params},
+        budget={
+            "max_tokens": matches
+            * (2 * int(params["rounds"]) + 1)
+            * _TOKENS_PER_MATCH_CALL
+        },
+        project_id=project.id,
+        created_by=created_by,
+    )
+    session.add(run)
+    await session.flush()
+    session.add(
+        Activity(
+            project_id=project.id,
+            actor=f"user:{created_by}" if created_by else "system",
+            kind="review.retry_started",
+            message=f"Idea 锦标赛补赛已启动（{matches} 场待补）",
+            payload={
+                "voyage_id": str(run.id),
+                "root_voyage_id": root_id,
+                "source_voyage_id": str(source.id),
+                "matches": matches,
+            },
+        )
+    )
+    await session.commit()
+    await session.refresh(run)
+    return run
+
+
+def _reverse_elo(rating_a: float, rating_b: float, winner: str) -> tuple[float, float]:
+    """Recover pre-match Elo from the two post-match ratings (K=32, no draws)."""
+    total = rating_a + rating_b
+    post_diff = rating_a - rating_b
+    score_a = 1.0 if winner == "a" else 0.0
+    low, high = -8000.0, 8000.0
+    for _ in range(100):
+        diff = (low + high) / 2.0
+        expected_a = 1.0 / (1.0 + 10 ** (-diff / 400.0))
+        calculated_post = diff + 64.0 * (score_a - expected_a)
+        if calculated_post < post_diff:
+            low = diff
+        else:
+            high = diff
+    before_diff = (low + high) / 2.0
+    return (total + before_diff) / 2.0, (total - before_diff) / 2.0
+
+
+async def undo_latest_tournament(
+    session: AsyncSession,
+    *,
+    project: Project,
+    created_by: uuid.UUID | None,
+) -> int:
+    """Undo the latest logical tournament round while preserving task/cost audit rows."""
+    await _lock_project_idea_creation(session, project.id)
+    if await find_running_idea_voyage(session, project.id) is not None:
+        raise IdeaVoyageConflictError(str(project.id))
+    latest = await latest_review_tournament(session, project.id)
+    if latest is None or latest.status not in TERMINAL_STATUSES:
+        raise TournamentUndoUnavailableError(str(project.id))
+    latest_params = (latest.checkpoint or {}).get("params") or {}
+    root_id = str(latest_params.get("retry_of") or latest.id)
+
+    runs = list(
+        (
+            await session.execute(
+                select(VoyageRun)
+                .where(VoyageRun.project_id == project.id, VoyageRun.kind == "idea_review")
+                .order_by(VoyageRun.created_at)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    group = [
+        run
+        for run in runs
+        if str(run.id) == root_id
+        or str(((run.checkpoint or {}).get("params") or {}).get("retry_of") or "") == root_id
+    ]
+    if not group or any((run.checkpoint or {}).get("review_undone_at") for run in group):
+        raise TournamentUndoUnavailableError(root_id)
+    group_ids = {str(run.id) for run in group}
+    root = next((run for run in group if str(run.id) == root_id), None)
+    if root is None:
+        raise TournamentUndoUnavailableError(root_id)
+
+    sessions = list(
+        (
+            await session.execute(
+                select(ReviewSession)
+                .join(Idea, Idea.id == ReviewSession.target_id)
+                .where(
+                    Idea.project_id == project.id,
+                    ReviewSession.target_type == "idea_match",
+                )
+                .order_by(ReviewSession.created_at)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    all_planned = {
+        _review_pair_key(str(pair[0]), str(pair[1]))
+        for run in group
+        for pair in ((run.checkpoint or {}).get("review_pairs") or [])
+        if isinstance(pair, list) and len(pair) == 2
+    }
+    end_at = max(run.updated_at for run in group)
+    selected_sessions = []
+    for review_session in sessions:
+        payload = review_session.payload or {}
+        voyage_id = str(payload.get("voyage_id") or "")
+        pair = _review_pair_key(
+            str(payload.get("idea_a") or review_session.target_id),
+            str(payload.get("idea_b") or ""),
+        )
+        legacy_match = (
+            not voyage_id
+            and root.created_at <= review_session.created_at <= end_at
+            and pair in all_planned
+        )
+        if voyage_id in group_ids or legacy_match:
+            selected_sessions.append(review_session)
+
+    snapshot = (root.checkpoint or {}).get("review_standings_before")
+    if isinstance(snapshot, dict) and snapshot:
+        for idea_id, before in snapshot.items():
+            idea = await session.get(Idea, uuid.UUID(str(idea_id)))
+            if idea is None or not isinstance(before, dict):
+                continue
+            idea.elo_rating = float(before.get("elo_rating", 1200.0))
+            idea.matches = int(before.get("matches", 0))
+            idea.wins = int(before.get("wins", 0))
+            if before.get("status"):
+                idea.status = str(before["status"])
+    else:
+        # Legacy rounds did not snapshot standings. Because every idea appears at most
+        # once per logical round, the Elo transform is safely invertible.
+        for review_session in reversed(selected_sessions):
+            payload = review_session.payload or {}
+            winner = payload.get("winner")
+            if review_session.status != "closed" or winner not in ("a", "b"):
+                continue
+            idea_a = await session.get(Idea, review_session.target_id)
+            idea_b_raw = payload.get("idea_b")
+            idea_b = await session.get(Idea, uuid.UUID(str(idea_b_raw))) if idea_b_raw else None
+            if idea_a is None or idea_b is None:
+                continue
+            idea_a.elo_rating, idea_b.elo_rating = _reverse_elo(
+                idea_a.elo_rating, idea_b.elo_rating, str(winner)
+            )
+            idea_a.matches = max(0, idea_a.matches - 1)
+            idea_b.matches = max(0, idea_b.matches - 1)
+            winner_idea = idea_a if winner == "a" else idea_b
+            winner_idea.wins = max(0, winner_idea.wins - 1)
+
+    for review_session in selected_sessions:
+        await session.delete(review_session)
+    undone_at = datetime.now(UTC).isoformat()
+    for run in group:
+        checkpoint = dict(run.checkpoint or {})
+        checkpoint["review_undone_at"] = undone_at
+        checkpoint["review_results"] = []
+        checkpoint["review_failed_pairs"] = []
+        run.checkpoint = checkpoint
+    session.add(
+        Activity(
+            project_id=project.id,
+            actor=f"user:{created_by}" if created_by else "system",
+            kind="review.round_undone",
+            message=f"已撤销最新一轮 Idea 锦标赛（删除 {len(selected_sessions)} 场记录）",
+            payload={
+                "root_voyage_id": root_id,
+                "voyage_ids": sorted(group_ids),
+                "sessions": len(selected_sessions),
+            },
+        )
+    )
+    await session.commit()
+    return len(selected_sessions)
 
 
 async def _validate_seed(
@@ -359,7 +691,7 @@ async def idea_counts(session: AsyncSession, project_id: uuid.UUID) -> dict[str,
     rows = (
         await session.execute(
             select(Idea.status, func.count())
-            .where(Idea.project_id == project_id)
+            .where(Idea.project_id == project_id, Idea.trashed_at.is_(None))
             .group_by(Idea.status)
         )
     ).all()

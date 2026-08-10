@@ -348,6 +348,103 @@ async def get_leaderboard(
     return [IdeaLeaderboardEntry.model_validate(i) for i in ideas]
 
 
+@router.post(
+    "/projects/{project_id}/review/ratings/reset",
+    response_model=BatchResult,
+)
+async def reset_tournament_ratings(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(current_active_user),
+) -> BatchResult:
+    """Reset Elo/matches/wins for all current (non-trashed) ideas. Owner/admin only."""
+    project = await _manage_idea_project(session, project_id, user)
+    try:
+        affected = await ideas_service.reset_tournament_ratings(
+            session,
+            project=project,
+            created_by=user.id,
+        )
+    except ideas_service.IdeaVoyageConflictError as e:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            detail="IDEA_VOYAGE_ALREADY_RUNNING",
+        ) from e
+    return BatchResult(affected=affected)
+
+
+@router.get("/projects/{project_id}/review/tournament/latest")
+async def latest_tournament_summary(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(current_active_user),
+) -> dict | None:
+    await _member_project(session, project_id, user)
+    run = await ideas_service.latest_review_tournament(session, project_id)
+    return ideas_service.review_tournament_summary(run)
+
+
+@router.post(
+    "/projects/{project_id}/review/tournament/retry-failed",
+    response_model=VoyageRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def retry_failed_tournament_matches(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(require_review),
+    queue: TaskQueue = Depends(get_task_queue),
+) -> VoyageRead:
+    project = await _member_project(session, project_id, user)
+    source = await ideas_service.latest_review_tournament(session, project_id)
+    if source is None:
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="NO_TOURNAMENT_TO_RETRY")
+    try:
+        run = await ideas_service.create_retry_tournament_voyage(
+            session,
+            project=project,
+            source=source,
+            created_by=user.id,
+        )
+    except ideas_service.IdeaVoyageConflictError as e:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail="IDEA_VOYAGE_ALREADY_RUNNING"
+        ) from e
+    except ideas_service.TournamentRetryUnavailableError as e:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail="TOURNAMENT_RETRY_UNAVAILABLE"
+        ) from e
+    await queue.enqueue("run_voyage", str(run.id))
+    return VoyageRead.model_validate(run)
+
+
+@router.post(
+    "/projects/{project_id}/review/tournament/undo-latest",
+    response_model=BatchResult,
+)
+async def undo_latest_tournament(
+    project_id: uuid.UUID,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(current_active_user),
+) -> BatchResult:
+    project = await _manage_idea_project(session, project_id, user)
+    try:
+        affected = await ideas_service.undo_latest_tournament(
+            session,
+            project=project,
+            created_by=user.id,
+        )
+    except ideas_service.IdeaVoyageConflictError as e:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail="IDEA_VOYAGE_ALREADY_RUNNING"
+        ) from e
+    except ideas_service.TournamentUndoUnavailableError as e:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, detail="TOURNAMENT_UNDO_UNAVAILABLE"
+        ) from e
+    return BatchResult(affected=affected)
+
+
 # ---- 讨论（人机同场） ----
 
 
