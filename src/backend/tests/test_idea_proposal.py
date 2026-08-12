@@ -12,11 +12,13 @@ import uuid
 from sqlalchemy import select
 
 from app.agents.voyage import VoyageEngine
+from app.agents.voyage.actions_proposal import _source_excerpt
 from app.core.db import get_sessionmaker
 from app.core.llm.router import LLMRouter
 from app.models.gate import Gate
 from app.models.idea import Idea
 from app.models.review import ReviewMessage, ReviewSession
+from app.models.voyage import VoyageRun
 from tests.conftest import RecordingBus, add_paper, register_and_login
 
 STATEMENT = "自动化科研 agent 的方法研究"
@@ -27,6 +29,35 @@ KNOBS = {
     "external_search": False,
     "revise_rounds": 1,
 }
+
+
+def test_revision_source_excerpt_is_selected_for_each_stage() -> None:
+    content = "\n\n".join(
+        (
+            "# 背景与相关工作\nBACKGROUND_ONLY " + "既有研究背景。" * 120,
+            "# 研究方案设计\nDESIGN_ONLY 使用分层稀疏专家路由，并分析适用边界。",
+            "# 实验与评估计划\nEXPERIMENT_ONLY 在公开数据集上比较基线、消融和准确率指标。",
+            "# 风险与备选方案\nRISK_ONLY 资源不足时切换为轻量模型并缩小数据范围。",
+        )
+    )
+
+    experiment = _source_excerpt(
+        content,
+        query="研究方案 既有研究 实验 评估 数据集 指标 基线 消融",
+        focus="实验 评估 数据集 指标 基线 消融",
+        max_chars=260,
+    )
+    risks = _source_excerpt(
+        content,
+        query="研究方案 既有研究 风险 备选方案 资源 可行性",
+        focus="风险 备选方案 资源 可行性",
+        max_chars=220,
+    )
+
+    assert "EXPERIMENT_ONLY" in experiment
+    assert "BACKGROUND_ONLY" not in experiment
+    assert "RISK_ONLY" in risks
+    assert "BACKGROUND_ONLY" not in risks
 
 
 async def _setup_project(client, *, statement=STATEMENT, email="alice@example.com"):
@@ -46,7 +77,8 @@ async def _seed_searchable_papers(project_id: str, statement: str, n: int = 3) -
     async with get_sessionmaker()() as session:
         ids = []
         for i in range(n):
-            paper = await add_paper(session,
+            paper = await add_paper(
+                session,
                 project_id=uuid.UUID(project_id),
                 source="manual",
                 title=f"Deep paper {i}",
@@ -467,6 +499,140 @@ async def test_deep_seed_validation_and_permissions(client, queue_stub):
             url, **({"json": body} if body is not None else {}), headers=headers_b
         )
         assert resp.status_code == 404, (method, url, resp.status_code)
+
+
+async def test_proposal_revision_snapshots_source_and_creates_independent_version(
+    client, queue_stub
+):
+    project_id, headers = await _setup_project(client, email="revision@example.com")
+    await _seed_searchable_papers(project_id, STATEMENT, n=3)
+
+    async with get_sessionmaker()() as session:
+        sketch = Idea(
+            project_id=uuid.UUID(project_id),
+            title="草案不能直接修订",
+            status="candidate",
+            depth="sketch",
+        )
+        source = Idea(
+            project_id=uuid.UUID(project_id),
+            title="旧标题：必须能够被新版本改写",
+            summary="旧方案概述",
+            content="# 旧方案\n\n旧正文",
+            scores={"novelty": 3.0},
+            elo_rating=1575.0,
+            matches=8,
+            wins=5,
+            status="under_review",
+            depth="proposal",
+            research_type="analysis",
+            goal={"question": "旧问题"},
+            evidence=[{"source": "signal", "title": "旧信号", "why": "修订依据"}],
+        )
+        session.add_all([sketch, source])
+        await session.commit()
+        await session.refresh(sketch)
+        await session.refresh(source)
+        sketch_id, source_id = str(sketch.id), str(source.id)
+
+    invalid = await client.post(
+        f"/api/projects/{project_id}/ideas/deep",
+        json={
+            "seed": {"type": "idea", "value": sketch_id},
+            "revision_instruction": "修改草案",
+            "knobs": KNOBS,
+        },
+        headers=headers,
+    )
+    assert invalid.status_code == 400
+    assert invalid.json()["detail"] == "REVISION_SOURCE_MUST_BE_PROPOSAL"
+
+    instruction = "改用新的方法路线，并根据新问题和方法重新拟定标题"
+    resp = await client.post(
+        f"/api/projects/{project_id}/ideas/deep",
+        json={
+            "seed": {"type": "idea", "value": source_id},
+            "revision_instruction": instruction,
+            "knobs": {**KNOBS, "confirm_goal": False},
+        },
+        headers=headers,
+    )
+    assert resp.status_code == 201, resp.text
+    run_id = resp.json()["id"]
+
+    async with get_sessionmaker()() as session:
+        run = await session.get(VoyageRun, uuid.UUID(run_id))
+        assert run is not None
+        assert run.checkpoint["params"]["revision_instruction"] == instruction
+        snapshot = run.checkpoint["source_snapshot"]
+        assert snapshot["id"] == source_id
+        assert snapshot["title"] == "旧标题：必须能够被新版本改写"
+        assert snapshot["content"] == "# 旧方案\n\n旧正文"
+        assert snapshot["evidence"][0]["title"] == "旧信号"
+
+    # 运行中的修订任务仍引用源方案，因此不能永久删除；软删除不受此限制。
+    blocked = await client.delete(f"/api/ideas/{source_id}?permanent=true", headers=headers)
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"] == "IDEA_USED_BY_RUNNING_DEEP_DIVE"
+
+    engine, _ = _make_engine()
+    await engine.run(uuid.UUID(run_id))
+    detail = await client.get(f"/api/voyages/{run_id}", headers=headers)
+    assert detail.json()["status"] == "done", detail.text
+
+    async with get_sessionmaker()() as session:
+        completed_run = await session.get(VoyageRun, uuid.UUID(run_id))
+        assert completed_run is not None
+        assert "source_snapshot" not in completed_run.checkpoint
+        assert completed_run.checkpoint["params"]["revision_instruction"] == instruction
+
+    async with get_sessionmaker()() as session:
+        derived = (
+            (
+                await session.execute(
+                    select(Idea).where(
+                        Idea.project_id == uuid.UUID(project_id),
+                        Idea.seed_idea_id == uuid.UUID(source_id),
+                    )
+                )
+            )
+            .scalars()
+            .one()
+        )
+        assert derived.id != uuid.UUID(source_id)
+        assert derived.title != "旧标题：必须能够被新版本改写"
+        assert derived.status == "candidate"
+        assert derived.depth == "proposal"
+        assert derived.elo_rating == 1200.0
+        assert derived.matches == 0 and derived.wins == 0
+        assert any(e.get("title") == "旧信号" for e in derived.evidence)
+        review_sessions = (
+            (
+                await session.execute(
+                    select(ReviewSession).where(
+                        ReviewSession.target_type == "idea_revision",
+                        ReviewSession.target_id == derived.id,
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        assert len(review_sessions) == 1
+        derived_id = str(derived.id)
+
+    trashed = await client.delete(f"/api/ideas/{source_id}", headers=headers)
+    assert trashed.status_code == 204
+    derived_detail = await client.get(f"/api/ideas/{derived_id}", headers=headers)
+    assert derived_detail.status_code == 200
+    assert derived_detail.json()["seed_idea"] == {
+        "id": source_id,
+        "title": "旧标题：必须能够被新版本改写",
+    }
+
+    blocked = await client.delete(f"/api/ideas/{source_id}?permanent=true", headers=headers)
+    assert blocked.status_code == 409
+    assert blocked.json()["detail"] == "IDEA_HAS_DERIVED_VERSIONS"
 
 
 async def test_deep_needs_differentiation_reworks_design(client, queue_stub):

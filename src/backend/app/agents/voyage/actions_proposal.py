@@ -17,6 +17,7 @@
 
 import asyncio
 import json
+import re
 import uuid
 from typing import Any
 
@@ -190,6 +191,8 @@ POLARIS_PROPOSAL_RISKS — 你是研究方案的「风险与备选方案」撰�
 TITLE_SYSTEM = """\
 POLARIS_PROPOSAL_TITLE — 你是研究方案的定稿者。基于研究目标与各节内容，产出标题、
 一句话概述和「预期成果与产出」。
+如果输入包含旧方案，旧标题只作为参考；必须根据新方案的研究问题、方法和贡献重新拟定
+最准确的标题，新标题允许且在内容实质变化时应当与旧标题不同。
 只输出一个 JSON 对象：
 {"title": "研究方案标题", "summary": "一句话概述",
  "expected": "预期成果与产出的 markdown 正文（论文/数据集/代码/结论等）"}
@@ -253,6 +256,121 @@ def _deep_knobs(ctx: ActionContext) -> dict[str, Any]:
 def _seed(ctx: ActionContext) -> dict[str, Any]:
     seed = _params(ctx).get("seed")
     return seed if isinstance(seed, dict) else {"type": "text", "value": ""}
+
+
+def _revision_instruction(ctx: ActionContext) -> str:
+    return str(_params(ctx).get("revision_instruction") or "").strip()
+
+
+def _source_snapshot(ctx: ActionContext) -> dict[str, Any] | None:
+    snapshot = ctx.checkpoint.get("source_snapshot")
+    return snapshot if isinstance(snapshot, dict) else None
+
+
+def _retrieval_terms(text: str) -> set[str]:
+    """中英文轻量检索词；中文用二元片段，避免依赖分词器或额外模型调用。"""
+    lowered = text.lower()
+    terms = set(re.findall(r"[a-z0-9_]{2,}", lowered))
+    for sequence in re.findall(r"[\u4e00-\u9fff]+", text):
+        terms.update(sequence[i : i + 2] for i in range(max(0, len(sequence) - 1)))
+    return terms
+
+
+def _source_excerpt(content: str, *, query: str, max_chars: int, focus: str = "") -> str:
+    """按当前阶段需要从完整方案中挑选相关 Markdown 片段，并保持原文顺序。"""
+    if len(content) <= max_chars:
+        return content
+
+    # 先按 Markdown 标题切节；超长章节再按段落拆分，标题随段落保留。
+    headings = list(re.finditer(r"(?m)^#{1,6}\s+.+$", content))
+    sections: list[tuple[int, str]] = []
+    if headings:
+        if headings[0].start() > 0:
+            sections.append((0, content[: headings[0].start()].strip()))
+        for index, match in enumerate(headings):
+            end = headings[index + 1].start() if index + 1 < len(headings) else len(content)
+            sections.append((match.start(), content[match.start() : end].strip()))
+    else:
+        sections = [(0, content)]
+
+    candidates: list[tuple[int, str]] = []
+    for offset, section in sections:
+        if len(section) <= 1400:
+            candidates.append((offset, section))
+            continue
+        lines = section.splitlines()
+        heading = lines[0] if lines and lines[0].startswith("#") else ""
+        body = "\n".join(lines[1:] if heading else lines)
+        paragraphs = [part.strip() for part in re.split(r"\n{2,}", body) if part.strip()]
+        cursor = offset
+        for paragraph in paragraphs or [body]:
+            prefix = f"{heading}\n" if heading else ""
+            available = max(200, 1400 - len(prefix))
+            for start in range(0, len(paragraph), available):
+                candidates.append((cursor + start, prefix + paragraph[start : start + available]))
+            cursor += len(paragraph) + 2
+
+    query_terms = _retrieval_terms(query)
+    focus_terms = _retrieval_terms(focus)
+    ranked = []
+    for offset, chunk in candidates:
+        chunk_terms = _retrieval_terms(chunk)
+        overlap = query_terms & chunk_terms
+        focus_overlap = focus_terms & chunk_terms
+        score = sum(1 + min(3, chunk.lower().count(term)) for term in overlap)
+        score += 6 * len(focus_overlap)
+        ranked.append((score, offset, chunk))
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    relevance_floor = max(1, int(ranked[0][0] * 0.35)) if ranked else 1
+    relevant = [item for item in ranked if item[0] >= relevance_floor]
+    ranked = relevant if relevant else ranked[:1]
+
+    selected: list[tuple[int, str]] = []
+    used = 0
+    for _score, offset, chunk in ranked:
+        separator = 18 if selected else 0
+        remaining = max_chars - used - separator
+        if remaining <= 0:
+            break
+        selected.append((offset, chunk[:remaining]))
+        used += min(len(chunk), remaining) + separator
+        if used >= max_chars:
+            break
+    selected.sort(key=lambda item: item[0])
+    return "\n\n…（省略不相关片段）…\n\n".join(chunk for _, chunk in selected)[:max_chars]
+
+
+def _render_source_snapshot(
+    snapshot: dict[str, Any], *, query: str, focus: str, max_chars: int = 4800
+) -> str:
+    header = (
+        f"旧方案标题：{snapshot.get('title') or '（无）'}\n"
+        f"旧方案概述：{str(snapshot.get('summary') or '（无）')[:800]}\n"
+        "旧方案研究目标："
+        f"{json.dumps(snapshot.get('goal') or {}, ensure_ascii=False)[:1400]}\n"
+        "旧方案正文摘录：\n"
+    )
+    content = str(snapshot.get("content") or "（无）")
+    content_budget = max(0, max_chars - len(header))
+    content = _source_excerpt(content, query=query, focus=focus, max_chars=content_budget)
+    return f"{header}{content}"[:max_chars]
+
+
+def _revision_context(ctx: ActionContext, *, focus: str, goal: dict[str, Any] | None = None) -> str:
+    instruction = _revision_instruction(ctx)
+    snapshot = _source_snapshot(ctx)
+    if not instruction or snapshot is None:
+        return ""
+    query = f"{focus}\n{instruction}\n{json.dumps(goal or {}, ensure_ascii=False)}"
+    priority = f"{focus}\n{instruction}"
+    return (
+        "修订任务说明：\n"
+        f"用户的修订要求：{instruction}\n\n"
+        f"{_render_source_snapshot(snapshot, query=query, focus=priority)}\n\n"
+        "旧方案仅是修订输入基线，不是必须保留的模板。请产出完整、自洽的新方案，"
+        "根据修订后的研究问题和方法重新决定标题；新标题可以与旧标题不同。"
+        "不要继承或复述旧方案的评分、Elo、比赛、候选状态或评审会话。"
+    )
 
 
 async def _log(ctx: ActionContext, message: str) -> None:
@@ -390,6 +508,16 @@ async def _seed_brief(ctx: ActionContext) -> str:
     value = str(seed.get("value") or "")
     if seed_type == "text":
         return f"种子（自由文本）：{value}"
+    snapshot = _source_snapshot(ctx)
+    if seed_type == "idea" and snapshot is not None:
+        if _revision_instruction(ctx):
+            return f"修订来源方案：{snapshot.get('title') or '（无标题）'}（详见修订任务说明）"
+        evidence = json.dumps(snapshot.get("evidence") or [], ensure_ascii=False)
+        return (
+            f"种子（想法）：{snapshot.get('title') or '（无标题）'}\n"
+            f"概述：{snapshot.get('summary') or '（无）'}\n"
+            f"内容：\n{str(snapshot.get('content') or '')[:1500]}\n依据信号：{evidence}"
+        )
     async with get_sessionmaker()() as session:
         if seed_type == "paper":
             paper = await session.get(Paper, uuid.UUID(value))
@@ -409,8 +537,8 @@ async def _seed_brief(ctx: ActionContext) -> str:
             if idea is not None:
                 evidence = json.dumps(idea.evidence or [], ensure_ascii=False)
                 return (
-                    f"种子（方向草案）：{idea.title}\n概述：{idea.summary or '（无）'}\n"
-                    f"草案内容：\n{(idea.content or '')[:1500]}\n草案依据信号：{evidence}"
+                    f"种子（想法）：{idea.title}\n概述：{idea.summary or '（无）'}\n"
+                    f"内容：\n{(idea.content or '')[:1500]}\n依据信号：{evidence}"
                 )
     return f"种子（{seed_type}，未找到对象，按文本处理）：{value}"
 
@@ -435,6 +563,12 @@ async def goal_explore(ctx: ActionContext, params: dict[str, Any]) -> dict[str, 
     library_ids, library_size = await _library_index(ctx)
 
     opening = f"研究方向：{statement}\n{seed_text}"
+    revision_context = _revision_context(
+        ctx,
+        focus="研究目标 核心问题 研究任务 目标 范围 成功标准 动机",
+    )
+    if revision_context:
+        opening += f"\n\n{revision_context}"
     if params.get("diagnosis"):
         opening += f"\n上次构建目标未通过验收，诊断：{params['diagnosis']}\n请针对性修正。"
     system = GOAL_EXPLORE_SYSTEM % {"tools": lit_tools.TOOL_SPECS}
@@ -535,9 +669,7 @@ async def _grounding_papers(ctx: ActionContext) -> list[tuple[Paper, str | None]
         rows = (
             dedupe_member_rows(
                 (
-                    await session.execute(
-                        member_papers_stmt(library_ids).where(Paper.id.in_(ids))
-                    )
+                    await session.execute(member_papers_stmt(library_ids).where(Paper.id.in_(ids)))
                 ).all()
             )
             if library_ids
@@ -551,6 +683,14 @@ def _goal_context(goal: dict[str, Any]) -> str:
     return (f"研究目标（goal）：\n{json.dumps(goal, ensure_ascii=False, indent=None)}")[
         :_SECTION_CONTEXT_CHARS
     ]
+
+
+def _proposal_context(ctx: ActionContext, goal: dict[str, Any], *, focus: str) -> str:
+    revision = _revision_context(ctx, focus=focus, goal=goal)
+    if not revision:
+        return _goal_context(goal)
+    goal_text = f"研究目标（goal）：\n{json.dumps(goal, ensure_ascii=False, indent=None)}"[:5200]
+    return f"{goal_text}\n\n{revision}"[:_SECTION_CONTEXT_CHARS]
 
 
 async def _grounding_context(ctx: ActionContext) -> str:
@@ -636,7 +776,8 @@ async def proposal_related_work(ctx: ActionContext, params: dict[str, Any]) -> d
 
     grounding_ids = [g["paper_id"] for g in goal.get("grounding") or []]
     opening = (
-        f"{_goal_context(goal)}\n\n{await _grounding_context(ctx)}\n\n"
+        f"{_proposal_context(ctx, goal, focus='背景 相关工作 文献 差异 新颖性')}\n\n"
+        f"{await _grounding_context(ctx)}\n\n"
         f"必须覆盖的库内论文 id：{json.dumps(grounding_ids, ensure_ascii=False)}\n"
         f"外部相关文献（须论证差异）：{json.dumps(external, ensure_ascii=False)[:4000]}"
     )
@@ -679,7 +820,8 @@ async def proposal_design(ctx: ActionContext, params: dict[str, Any]) -> dict[st
         return _self_check(True, "design 已完成（断点续跑）", skipped=True)
     template = DESIGN_TEMPLATES.get(goal["research_type"], DESIGN_TEMPLATES["method"])
     user = (
-        f"{_goal_context(goal)}\n\n{await _grounding_context(ctx)}\n\n"
+        f"{_proposal_context(ctx, goal, focus='研究方案设计 方法 创新 理论 适用边界')}\n\n"
+        f"{await _grounding_context(ctx)}\n\n"
         f"已完成的「背景与相关工作」：\n{_sections(ctx).get('related_work', '')[:3000]}"
     )
     if params.get("diagnosis"):
@@ -712,7 +854,8 @@ async def proposal_experiments(ctx: ActionContext, params: dict[str, Any]) -> di
         return _self_check(True, "experiments 已完成（断点续跑）", skipped=True)
     goal = _goal(ctx)
     user = (
-        f"{_goal_context(goal)}\n\n{await _resources_profile(ctx)}\n\n"
+        f"{_proposal_context(ctx, goal, focus='实验 评估 数据集 指标 基线 消融 算力 最小验证')}\n\n"
+        f"{await _resources_profile(ctx)}\n\n"
         f"研究方案设计：\n{_sections(ctx).get('design', '')[:4000]}"
     )
     if params.get("diagnosis"):
@@ -808,9 +951,7 @@ async def _internal_similar(ctx: ActionContext, query_text: str) -> list[dict[st
                     )
                     known = await paper_vectors(session, [p.id for p in papers], space)
                     scored = [
-                        (cosine_similarity(vector, known[p.id]), p)
-                        for p in papers
-                        if p.id in known
+                        (cosine_similarity(vector, known[p.id]), p) for p in papers if p.id in known
                     ]
                     scored.sort(key=lambda x: -x[0])
                     scored = scored[:_INTERNAL_SIMILAR_K]
@@ -861,7 +1002,8 @@ async def proposal_novelty_check(ctx: ActionContext, params: dict[str, Any]) -> 
 
     similar_block = json.dumps({"library": internal, "external": external}, ensure_ascii=False)
     user = (
-        f"{_goal_context(goal)}\n\n本方案设计概要：\n{design[:3000]}\n\n"
+        f"{_proposal_context(ctx, goal, focus='新颖性 相关工作 差异 创新')}\n\n"
+        f"本方案设计概要：\n{design[:3000]}\n\n"
         f"相似工作清单：\n{similar_block[:6000]}"
     )
 
@@ -938,7 +1080,8 @@ async def proposal_risks(ctx: ActionContext, params: dict[str, Any]) -> dict[str
     goal = _goal(ctx)
     novelty = ctx.checkpoint.get("novelty") or {}
     user = (
-        f"{_goal_context(goal)}\n\n{await _resources_profile(ctx)}\n\n"
+        f"{_proposal_context(ctx, goal, focus='风险 备选方案 局限 可行性 资源')}\n\n"
+        f"{await _resources_profile(ctx)}\n\n"
         "新颖性核查结论："
         f"{json.dumps(novelty.get('comparisons') or [], ensure_ascii=False)[:2000]}\n"
         f"实验计划概要：\n{_sections(ctx).get('experiments', '')[:2000]}"
@@ -1057,15 +1200,19 @@ async def _build_evidence(ctx: ActionContext) -> list[dict[str, Any]]:
                 "source": "external",
             }
         )
-    # 种子草案的信号依据一并继承
+    # 种子想法的信号依据一并继承；修订任务只读取启动时快照。
     seed = _seed(ctx)
     if seed.get("type") == "idea":
-        async with get_sessionmaker()() as session:
-            try:
-                sketch = await session.get(Idea, uuid.UUID(str(seed.get("value"))))
-            except ValueError:
-                sketch = None
-        for item in (sketch.evidence if sketch is not None else None) or []:
+        snapshot = _source_snapshot(ctx)
+        inherited_evidence = snapshot.get("evidence") if snapshot is not None else None
+        if inherited_evidence is None:
+            async with get_sessionmaker()() as session:
+                try:
+                    source_idea = await session.get(Idea, uuid.UUID(str(seed.get("value"))))
+                except ValueError:
+                    source_idea = None
+            inherited_evidence = source_idea.evidence if source_idea is not None else None
+        for item in inherited_evidence or []:
             if isinstance(item, dict) and item.get("source") == "signal":
                 evidence.append(item)
     return evidence
@@ -1092,12 +1239,18 @@ async def proposal_assemble(ctx: ActionContext, params: dict[str, Any]) -> dict[
             "expected": str(data.get("expected") or "").strip(),
         }
 
+    title_context = _proposal_context(
+        ctx,
+        goal,
+        focus="标题 概述 核心问题 方法 创新 贡献 预期成果",
+    )
     meta = await _complete_json(
         ctx,
         stage="proposal",
         system=TITLE_SYSTEM,
         user=(
-            f"{_goal_context(goal)}\n\n各节概要：\n"
+            f"{title_context}\n\n"
+            "各节概要：\n"
             + "\n".join(f"### {SECTION_TITLES.get(k, k)}\n{v[:800]}" for k, v in sections.items())
         ),
         validate=validate_title,
@@ -1130,6 +1283,8 @@ async def proposal_assemble(ctx: ActionContext, params: dict[str, Any]) -> dict[
             seed_idea_id = None
 
     async with get_sessionmaker()() as session:
+        if seed_idea_id is not None and await session.get(Idea, seed_idea_id) is None:
+            seed_idea_id = None
         embedding: list[float] | None = None
         space: EmbeddingSpace | None = None
         try:
@@ -1178,6 +1333,9 @@ async def proposal_assemble(ctx: ActionContext, params: dict[str, Any]) -> dict[
         await session.commit()
 
     ctx.checkpoint["idea_id"] = idea_id
+    # 新方案已成功入库，后续评审只依赖新方案与已生成章节；完整来源快照不再需要。
+    # 入库前失败/暂停的任务不会走到这里，因此仍可依靠完整快照断点恢复。
+    ctx.checkpoint.pop("source_snapshot", None)
     await ctx.notify(
         {"type": "idea.created", "project_id": str(ctx.run.project_id), "idea_id": idea_id}
     )

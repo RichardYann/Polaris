@@ -66,6 +66,18 @@ class InvalidSeedError(Exception):
     """深耕种子引用的 concept/paper/idea 不存在或不属于本项目。"""
 
 
+class InvalidRevisionSourceError(Exception):
+    """继续修订只能以已完成的研究方案作为来源。"""
+
+
+class IdeaDeletionBlockedError(Exception):
+    """想法仍被衍生版本或运行中的深度任务引用，不能永久删除。"""
+
+    def __init__(self, detail: str):
+        super().__init__(detail)
+        self.detail = detail
+
+
 class TournamentRetryUnavailableError(Exception):
     """The latest tournament is running, fully successful, or already undone."""
 
@@ -99,9 +111,7 @@ async def _lock_project_idea_creation(session: AsyncSession, project_id: uuid.UU
     await session.execute(select(Project.id).where(Project.id == project_id).with_for_update())
 
 
-async def _running_deep_voyages(
-    session: AsyncSession, project_id: uuid.UUID
-) -> list[VoyageRun]:
+async def _running_deep_voyages(session: AsyncSession, project_id: uuid.UUID) -> list[VoyageRun]:
     stmt = (
         select(VoyageRun)
         .where(
@@ -348,11 +358,7 @@ async def create_retry_tournament_voyage(
         status="planning",
         cursor=0,
         checkpoint={"params": params},
-        budget={
-            "max_tokens": matches
-            * (2 * int(params["rounds"]) + 1)
-            * _TOKENS_PER_MATCH_CALL
-        },
+        budget={"max_tokens": matches * (2 * int(params["rounds"]) + 1) * _TOKENS_PER_MATCH_CALL},
         project_id=project.id,
         created_by=created_by,
     )
@@ -546,16 +552,20 @@ async def _validate_seed(
         if paper is None:
             raise InvalidSeedError(value)
         library_ids = await get_source_library_ids(session, project_id)
-        in_corpus = bool(library_ids) and (
-            await session.execute(
-                select(LibraryPaper.paper_id)
-                .where(
-                    LibraryPaper.library_id.in_(library_ids),
-                    LibraryPaper.paper_id == paper.id,
+        in_corpus = (
+            bool(library_ids)
+            and (
+                await session.execute(
+                    select(LibraryPaper.paper_id)
+                    .where(
+                        LibraryPaper.library_id.in_(library_ids),
+                        LibraryPaper.paper_id == paper.id,
+                    )
+                    .limit(1)
                 )
-                .limit(1)
-            )
-        ).first() is not None
+            ).first()
+            is not None
+        )
         if not in_corpus:
             raise InvalidSeedError(value)
         return f"论文《{paper.title[:60]}》"
@@ -565,13 +575,17 @@ async def _validate_seed(
             raise InvalidSeedError(value)
         library_ids = await get_source_library_ids(session, project_id)
         # 概念不属于任何库：在不在本课题语料内 = 有没有本课题库里的论文用到它
-        in_corpus = bool(library_ids) and (
-            await session.execute(
-                library_concept_ids(library_ids)
-                .where(paper_concepts.c.concept_id == concept.id)
-                .limit(1)
-            )
-        ).first() is not None
+        in_corpus = (
+            bool(library_ids)
+            and (
+                await session.execute(
+                    library_concept_ids(library_ids)
+                    .where(paper_concepts.c.concept_id == concept.id)
+                    .limit(1)
+                )
+            ).first()
+            is not None
+        )
         if not in_corpus:
             raise InvalidSeedError(value)
         return f"概念「{concept.name}」"
@@ -581,6 +595,21 @@ async def _validate_seed(
             raise InvalidSeedError(value)
         return f"草案「{idea.title[:60]}」"
     raise InvalidSeedError(seed_type)
+
+
+def _idea_seed_snapshot(idea: Idea) -> dict[str, Any]:
+    """把 idea 种子冻结到 voyage，避免任务运行期间依赖可删除的源记录。"""
+    return {
+        "id": str(idea.id),
+        "title": idea.title,
+        "summary": idea.summary,
+        "content": idea.content,
+        "goal": idea.goal,
+        "evidence": idea.evidence,
+        "parent_paper_ids": idea.parent_paper_ids,
+        "depth": idea.depth,
+        "research_type": idea.research_type,
+    }
 
 
 async def create_deep_voyage(
@@ -601,13 +630,33 @@ async def create_deep_voyage(
     seed_brief = await _validate_seed(
         session, project_id=project.id, seed_type=data.seed.type, value=data.seed.value
     )
+    revision_instruction = (data.revision_instruction or "").strip() or None
+    source_snapshot: dict[str, Any] | None = None
+    if data.seed.type == "idea":
+        source = await session.get(Idea, uuid.UUID(data.seed.value))
+        if source is None or source.project_id != project.id:  # 防御并发删除
+            raise InvalidSeedError(data.seed.value)
+        if revision_instruction and source.depth != "proposal":
+            raise InvalidRevisionSourceError(data.seed.value)
+        source_snapshot = _idea_seed_snapshot(source)
+    elif revision_instruction:
+        raise InvalidRevisionSourceError(data.seed.value)
     budget = data.knobs.budget_tokens or _DEEP_DEFAULT_BUDGET
+    checkpoint: dict[str, Any] = {
+        "params": {
+            "seed": data.seed.model_dump(),
+            "knobs": data.knobs.model_dump(),
+            "revision_instruction": revision_instruction,
+        }
+    }
+    if source_snapshot is not None:
+        checkpoint["source_snapshot"] = source_snapshot
     run = VoyageRun(
         kind="idea_proposal",
         goal=f"深度研究方案：{project.name}",
         status="planning",
         cursor=0,
-        checkpoint={"params": {"seed": data.seed.model_dump(), "knobs": data.knobs.model_dump()}},
+        checkpoint=checkpoint,
         budget={"max_tokens": budget},
         project_id=project.id,
         created_by=created_by,
@@ -618,8 +667,16 @@ async def create_deep_voyage(
             project_id=project.id,
             actor=f"user:{created_by}" if created_by else "system",
             kind="idea.deep_started",
-            message=f"深度想法生成已启动（种子：{seed_brief}）",
-            payload={"seed": data.seed.model_dump(), "knobs": data.knobs.model_dump()},
+            message=(
+                f"方案继续修订已启动（来源：{seed_brief}）"
+                if revision_instruction
+                else f"深度想法生成已启动（种子：{seed_brief}）"
+            ),
+            payload={
+                "seed": data.seed.model_dump(),
+                "knobs": data.knobs.model_dump(),
+                "revision": bool(revision_instruction),
+            },
         )
     )
     await session.commit()
@@ -649,7 +706,7 @@ async def deep_state(session: AsyncSession, project: Project) -> dict[str, Any]:
 
     running_voyages = []
     for run in running:
-        params = ((run.checkpoint or {}).get("params") or {})
+        params = (run.checkpoint or {}).get("params") or {}
         seed = params.get("seed") if isinstance(params.get("seed"), dict) else None
         running_voyages.append(
             {
@@ -773,9 +830,7 @@ async def get_idea_for_user(
     session: AsyncSession, *, idea_id: uuid.UUID, user_id: uuid.UUID
 ) -> Idea | None:
     """取 idea；非项目成员视为不存在（平台管理员够得着全部课题）。"""
-    stmt = select(Idea).where(
-        Idea.id == idea_id, in_my_projects(Idea.project_id, user_id)
-    )
+    stmt = select(Idea).where(Idea.id == idea_id, in_my_projects(Idea.project_id, user_id))
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
@@ -826,10 +881,46 @@ async def purge_ideas(
             if i.trashed_at is not None
         ]
     n = len(rows)
+    await ensure_ideas_can_be_permanently_deleted(
+        session, project_id=project_id, idea_ids=[idea.id for idea in rows]
+    )
     for idea in rows:
         await session.delete(idea)
     await session.commit()
     return n
+
+
+async def ensure_ideas_can_be_permanently_deleted(
+    session: AsyncSession, *, project_id: uuid.UUID, idea_ids: Sequence[uuid.UUID]
+) -> None:
+    """保留版本链：有存活衍生版本或运行中任务引用时拒绝永久删除。"""
+    target_ids = set(idea_ids)
+    if not target_ids:
+        return
+
+    derived = (
+        await session.execute(
+            select(Idea.id).where(
+                Idea.project_id == project_id,
+                Idea.seed_idea_id.in_(target_ids),
+                Idea.id.not_in(target_ids),
+            )
+        )
+    ).first()
+    if derived is not None:
+        raise IdeaDeletionBlockedError("IDEA_HAS_DERIVED_VERSIONS")
+
+    for run in await _running_deep_voyages(session, project_id):
+        params = (run.checkpoint or {}).get("params") or {}
+        seed = params.get("seed") or {}
+        if seed.get("type") != "idea":
+            continue
+        try:
+            source_id = uuid.UUID(str(seed.get("value")))
+        except (TypeError, ValueError):
+            continue
+        if source_id in target_ids:
+            raise IdeaDeletionBlockedError("IDEA_USED_BY_RUNNING_DEEP_DIVE")
 
 
 async def set_idea_status(session: AsyncSession, idea: Idea, status: str) -> Idea:

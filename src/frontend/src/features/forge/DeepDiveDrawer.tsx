@@ -32,9 +32,11 @@ export interface DeepDiveDrawerProps {
   pid: string;
   /** 「深化」入口预选的草案（seed.type=idea）。 */
   initialSeedIdea?: { id: string; title: string } | null;
+  /** revise 固定以已有完整方案为快照基线，要求用户填写修改要求。 */
+  mode?: 'deep' | 'revise';
 }
 
-export function DeepDiveDrawer({ open, onClose, pid, initialSeedIdea }: DeepDiveDrawerProps) {
+export function DeepDiveDrawer({ open, onClose, pid, initialSeedIdea, mode = 'deep' }: DeepDiveDrawerProps) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
 
@@ -45,6 +47,7 @@ export function DeepDiveDrawer({ open, onClose, pid, initialSeedIdea }: DeepDive
   const [paperId, setPaperId] = useState('');
   const [paperQ, setPaperQ] = useState('');
   const [ideaId, setIdeaId] = useState('');
+  const [revisionInstruction, setRevisionInstruction] = useState('');
   const [confirmGoal, setConfirmGoal] = useState(true);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const [externalSearch, setExternalSearch] = useState(true);
@@ -60,11 +63,12 @@ export function DeepDiveDrawer({ open, onClose, pid, initialSeedIdea }: DeepDive
     setPaperId('');
     setPaperQ('');
     setIdeaId(initialSeedIdea?.id ?? '');
+    setRevisionInstruction('');
     setConfirmGoal(true);
     setShowAdvanced(false);
     setExternalSearch(true);
     setReviseRounds(2);
-  }, [open, initialSeedIdea]);
+  }, [open, initialSeedIdea, mode]);
 
   // —— 种子选项数据 ——
   const conceptsQuery = useQuery({
@@ -90,7 +94,7 @@ export function DeepDiveDrawer({ open, onClose, pid, initialSeedIdea }: DeepDive
   const sketchesQuery = useQuery({
     queryKey: ['deep-seed-sketches', pid],
     queryFn: () => api.listIdeas(pid, { depth: 'sketch', sort: '-created_at' }),
-    enabled: open && seedType === 'idea',
+    enabled: open && mode === 'deep' && seedType === 'idea',
     retry: false,
   });
   const sketches = sketchesQuery.data ?? [];
@@ -104,18 +108,26 @@ export function DeepDiveDrawer({ open, onClose, pid, initialSeedIdea }: DeepDive
   const mutation = useMutation({
     mutationFn: () =>
       api.startDeepIdea(pid, {
-        seed: { type: seedType, value: seedValue },
+        seed: { type: mode === 'revise' ? 'idea' : seedType, value: mode === 'revise' ? (initialSeedIdea?.id ?? '') : seedValue },
         knobs: { confirm_goal: confirmGoal, external_search: externalSearch, revise_rounds: reviseRounds },
+        revision_instruction: mode === 'revise' ? revisionInstruction.trim() : undefined,
       }),
     onSuccess: (v) => {
-      toast(tr('深度生成已开始，跳转任务详情…', 'Deep Dive started — opening the task…'), 'ok');
+      toast(
+        mode === 'revise'
+          ? tr('新版本生成已开始，跳转任务详情…', 'New revision started — opening the task…')
+          : tr('深度生成已开始，跳转任务详情…', 'Deep Dive started — opening the task…'),
+        'ok',
+      );
       void queryClient.invalidateQueries({ queryKey: ['deep-state', pid] });
       void queryClient.invalidateQueries({ queryKey: ['forge-state', pid] });
       onClose();
       navigate(`/voyages/${v.id}`);
     },
     onError: (e) => {
-      if (e instanceof ApiError && e.status === 409) {
+      if (e instanceof ApiError && e.status === 400 && e.message === 'REVISION_SOURCE_MUST_BE_PROPOSAL') {
+        toast(tr('只有完整研究方案可以继续修订。', 'Only a full proposal can be revised.'), 'error');
+      } else if (e instanceof ApiError && e.status === 409) {
         const message =
           e.message === 'IDEA_PROPOSAL_LIMIT_REACHED'
             ? tr('本课题已有 4 个深度生成任务，请等待至少一个完成。', 'This topic already has 4 Deep Dive tasks — wait for one to finish.')
@@ -131,7 +143,10 @@ export function DeepDiveDrawer({ open, onClose, pid, initialSeedIdea }: DeepDive
     },
   });
 
-  const canSubmit = !!seedValue && !mutation.isPending;
+  const canSubmit =
+    (mode === 'revise'
+      ? !!initialSeedIdea?.id && !!revisionInstruction.trim()
+      : !!seedValue) && !mutation.isPending;
 
   return (
     <Drawer
@@ -140,11 +155,49 @@ export function DeepDiveDrawer({ open, onClose, pid, initialSeedIdea }: DeepDive
       title={
         <>
           <Icon name="sparkle" size={18} style={{ color: 'var(--accent)' }} />
-          <span style={{ fontSize: 15, fontWeight: 680 }}>{tr('深度生成', 'Deep Dive')}</span>
+          <span style={{ fontSize: 15, fontWeight: 680 }}>
+            {mode === 'revise' ? tr('继续修订', 'Revise proposal') : tr('深度生成', 'Deep Dive')}
+          </span>
         </>
       }
-      sub={tr('AI 检索文献并起草完整研究方案。', 'The AI searches the literature and drafts a full proposal.')}
+      sub={
+        mode === 'revise'
+          ? tr(
+              '以当前方案的启动快照为基线生成独立新版本；标题和内容都可以改变，新版本独立评分与评审。',
+              'Create an independent version from a startup snapshot. Its title and content may both change, and it is scored and reviewed independently.',
+            )
+          : tr('AI 检索文献并起草完整研究方案。', 'The AI searches the literature and drafts a full proposal.')
+      }
     >
+      {mode === 'revise' ? (
+        <>
+          <FormField label={tr('修订来源', 'Revision source')} en="source proposal">
+            <div className="input" style={{ background: 'var(--surface-2)', cursor: 'default' }}>
+              {initialSeedIdea?.title ?? tr('未选择方案', 'No proposal selected')}
+            </div>
+          </FormField>
+          <FormField
+            label={tr('修订要求', 'Revision instructions')}
+            en="required"
+            hint={tr(
+              '说明希望调整的问题、方法、范围或标题。旧方案只是基线，不会限制新版本标题。',
+              'Describe changes to the question, method, scope, or title. The old proposal is only a baseline and does not constrain the new title.',
+            )}
+          >
+            <textarea
+              className="textarea"
+              rows={5}
+              value={revisionInstruction}
+              onChange={(e) => setRevisionInstruction(e.target.value)}
+              placeholder={tr(
+                '例如：缩小研究范围，改用多模态对比学习方法，并根据新方法重新拟定标题。',
+                'For example: narrow the scope, use multimodal contrastive learning, and rename the proposal to match the new method.',
+              )}
+            />
+          </FormField>
+        </>
+      ) : (
+      <>
       <FormField
         label={tr('种子', 'Seed')}
         en="seed"
@@ -231,6 +284,8 @@ export function DeepDiveDrawer({ open, onClose, pid, initialSeedIdea }: DeepDive
           />
         </FormField>
       )}
+      </>
+      )}
 
       <FormField
         label={tr('生成前人工确认研究目标', 'Confirm the research goal first')}
@@ -297,7 +352,9 @@ export function DeepDiveDrawer({ open, onClose, pid, initialSeedIdea }: DeepDive
         ) : (
           <>
             <Icon name="play" size={14} />
-            {tr('开始深度生成', 'Start Deep Dive')}
+            {mode === 'revise'
+              ? tr('生成独立新版本', 'Generate independent version')
+              : tr('开始深度生成', 'Start Deep Dive')}
           </>
         )}
       </button>

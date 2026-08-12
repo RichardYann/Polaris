@@ -21,6 +21,7 @@ import { useShell } from '../../app/AppShell';
 import { topicPath, useProject } from '../../app/project';
 import { DiscussionPanel } from '../review/DiscussionPanel';
 import { DiscussionBubble } from '../review/messages';
+import { DeepDiveDrawer } from './DeepDiveDrawer';
 import { compositeOf, DepthBadge, ResearchTypeBadge, RubricBar, SCORE_DIMS } from './ideaShared';
 
 /* ============================================================
@@ -428,6 +429,10 @@ export function IdeaDetailPage() {
   const queryClient = useQueryClient();
   const { openGates } = useShell();
   const { currentProjectId } = useProject();
+  const [deepDrawer, setDeepDrawer] = useState<{
+    mode: 'deep' | 'revise';
+    seed: { id: string; title: string } | null;
+  } | null>(null);
 
   const ideaQuery = useQuery({
     queryKey: ['idea', id],
@@ -521,6 +526,7 @@ export function IdeaDetailPage() {
   const actionable = idea.status === 'candidate' || idea.status === 'under_review';
 
   return (
+    <>
     <div className="page fadeup">
       {/* 头部 */}
       <button className="btn btn-soft sm" onClick={() => navigate(topicPath(idea.project_id, 'forge'))} style={{ marginBottom: 16 }}>
@@ -548,7 +554,7 @@ export function IdeaDetailPage() {
       {idea.seed_idea ? (
         <div className="row gap6" style={{ fontSize: 12, color: 'var(--text-3)', margin: '0 0 22px' }}>
           <Icon name="git" size={13} />
-          {tr('深化自：', 'Deepened from: ')}
+          {tr('来源版本：', 'Derived from: ')}
           <span
             className="hoverable"
             style={{ color: 'var(--accent-text)', fontWeight: 600 }}
@@ -591,6 +597,38 @@ export function IdeaDetailPage() {
         <div className="col gap16" style={{ flex: 1, minWidth: 0, maxWidth: 400 }}>
           <ScoresCard idea={idea} />
           <EvidenceCard idea={idea} />
+
+          {idea.depth === 'proposal' && (
+            <div className="card card-pad">
+              <div style={{ fontSize: 13.5, fontWeight: 650, marginBottom: 4 }}>
+                {tr('生成新版本', 'Create a new version')}
+              </div>
+              <div style={{ fontSize: 11.5, color: 'var(--text-2)', lineHeight: 1.55, marginBottom: 14 }}>
+                {tr(
+                  '继续修订会把当前方案快照作为基线，并允许同时修改标题和内容；重新生成则回到原始种子重新探索。两者都会创建独立评分、独立评审的新方案。',
+                  'Revise uses a snapshot of this proposal and may change both title and content. Regenerate explores again from the original seed. Both create a separately scored and reviewed proposal.',
+                )}
+              </div>
+              <div className="row gap8">
+                <button
+                  className="btn btn-primary"
+                  style={{ flex: 1, justifyContent: 'center' }}
+                  onClick={() => setDeepDrawer({ mode: 'revise', seed: { id: idea.id, title: idea.title } })}
+                >
+                  <Icon name="sparkle" size={14} />
+                  {tr('继续修订', 'Revise')}
+                </button>
+                <button
+                  className="btn btn-ghost"
+                  style={{ flex: 1, justifyContent: 'center' }}
+                  onClick={() => setDeepDrawer({ mode: 'deep', seed: idea.seed_idea })}
+                >
+                  <Icon name="refresh" size={14} />
+                  {tr('重新生成', 'Regenerate')}
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* parent papers */}
           <div className="card card-pad">
@@ -667,5 +705,13 @@ export function IdeaDetailPage() {
         </div>
       </div>
     </div>
+    <DeepDiveDrawer
+      open={deepDrawer !== null}
+      onClose={() => setDeepDrawer(null)}
+      pid={idea.project_id}
+      mode={deepDrawer?.mode ?? 'deep'}
+      initialSeedIdea={deepDrawer?.seed ?? null}
+    />
+    </>
   );
 }

@@ -63,6 +63,9 @@ class DeepKnobs(BaseModel):
 class DeepIdeaRequest(BaseModel):
     seed: DeepSeed
     knobs: DeepKnobs = DeepKnobs()
+    # 非空时表示基于一个已完成 proposal 创建新版本；原方案只作为修订基线，
+    # 新版本仍会生成独立标题、正文、评分与评审记录。
+    revision_instruction: str | None = Field(default=None, min_length=1, max_length=4000)
 
 
 class DeepRunningVoyage(BaseModel):
@@ -117,7 +120,7 @@ class IdeaDetail(IdeaRead):
     score_rationale: dict[str, Any] | None
     goal: dict[str, Any] | None  # 结构化研究目标（docs/api-idea2.md §3）
     evidence: list[dict[str, Any]] | None  # [{paper_id?, title, url?, why, source}]
-    seed_idea: SeedIdeaBrief | None  # 深化来源草案
+    seed_idea: SeedIdeaBrief | None  # 深化来源草案或修订来源方案
 
 
 class IdeaUpdate(BaseModel):

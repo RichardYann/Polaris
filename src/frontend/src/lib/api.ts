@@ -1613,6 +1613,13 @@ export interface DeepKnobs {
   budget_tokens?: number | null;
 }
 
+export interface DeepIdeaInput {
+  seed: DeepSeed;
+  knobs?: DeepKnobs;
+  /** 以已有 proposal 为快照基线生成独立新版本时的修改要求。 */
+  revision_instruction?: string;
+}
+
 export interface DeepRunningVoyage {
   voyage_id: string;
   status: string;
@@ -3911,7 +3918,7 @@ export const api = {
 
   // —— Idea 深度生成（Idea 2.0）——
   /** 发起深度生成（kind=idea_proposal）；同课题最多 4 个且同 seed 唯一；seed 不存在 404。 */
-  startDeepIdea(projectId: string, input: { seed: DeepSeed; knobs?: DeepKnobs }): Promise<VoyageRead> {
+  startDeepIdea(projectId: string, input: DeepIdeaInput): Promise<VoyageRead> {
     return requestJson<VoyageRead>(`/projects/${projectId}/ideas/deep`, 'POST', input);
   },
   getDeepIdeaState(projectId: string): Promise<DeepIdeaState> {

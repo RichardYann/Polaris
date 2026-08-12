@@ -69,6 +69,10 @@ async def _member_session(
     raise HTTPException(status.HTTP_404_NOT_FOUND, detail="SESSION_NOT_FOUND")
 
 
+def _raise_deletion_blocked(error: ideas_service.IdeaDeletionBlockedError) -> None:
+    raise HTTPException(status.HTTP_409_CONFLICT, detail=error.detail) from error
+
+
 # ---- Idea Forge（生成） ----
 
 
@@ -135,6 +139,11 @@ async def start_deep_idea(
         ) from e
     except ideas_service.InvalidSeedError as e:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="SEED_NOT_FOUND") from e
+    except ideas_service.InvalidRevisionSourceError as e:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            detail="REVISION_SOURCE_MUST_BE_PROPOSAL",
+        ) from e
     await queue.enqueue("run_voyage", str(run.id))
     return VoyageRead.model_validate(run)
 
@@ -196,6 +205,12 @@ async def delete_idea(
     idea = await _member_idea(session, idea_id, user)
     await _manage_idea_project(session, idea.project_id, user)
     if permanent:
+        try:
+            await ideas_service.ensure_ideas_can_be_permanently_deleted(
+                session, project_id=idea.project_id, idea_ids=[idea.id]
+            )
+        except ideas_service.IdeaDeletionBlockedError as e:
+            _raise_deletion_blocked(e)
         await session.delete(idea)
         await session.commit()
     else:
@@ -228,7 +243,10 @@ async def batch_ideas(
     elif data.action == "restore":
         n = await ideas_service.restore_ideas(session, project_id=project_id, ids=data.ids)
     else:
-        n = await ideas_service.purge_ideas(session, project_id=project_id, ids=data.ids)
+        try:
+            n = await ideas_service.purge_ideas(session, project_id=project_id, ids=data.ids)
+        except ideas_service.IdeaDeletionBlockedError as e:
+            _raise_deletion_blocked(e)
     return BatchResult(affected=n)
 
 
@@ -239,7 +257,10 @@ async def empty_idea_trash(
     user: User = Depends(current_active_user),
 ) -> BatchResult:
     await _manage_idea_project(session, project_id, user)
-    n = await ideas_service.purge_ideas(session, project_id=project_id, ids=None)
+    try:
+        n = await ideas_service.purge_ideas(session, project_id=project_id, ids=None)
+    except ideas_service.IdeaDeletionBlockedError as e:
+        _raise_deletion_blocked(e)
     return BatchResult(affected=n)
 
 
@@ -407,13 +428,9 @@ async def retry_failed_tournament_matches(
             created_by=user.id,
         )
     except ideas_service.IdeaVoyageConflictError as e:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT, detail="IDEA_VOYAGE_ALREADY_RUNNING"
-        ) from e
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="IDEA_VOYAGE_ALREADY_RUNNING") from e
     except ideas_service.TournamentRetryUnavailableError as e:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT, detail="TOURNAMENT_RETRY_UNAVAILABLE"
-        ) from e
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="TOURNAMENT_RETRY_UNAVAILABLE") from e
     await queue.enqueue("run_voyage", str(run.id))
     return VoyageRead.model_validate(run)
 
@@ -435,13 +452,9 @@ async def undo_latest_tournament(
             created_by=user.id,
         )
     except ideas_service.IdeaVoyageConflictError as e:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT, detail="IDEA_VOYAGE_ALREADY_RUNNING"
-        ) from e
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="IDEA_VOYAGE_ALREADY_RUNNING") from e
     except ideas_service.TournamentUndoUnavailableError as e:
-        raise HTTPException(
-            status.HTTP_409_CONFLICT, detail="TOURNAMENT_UNDO_UNAVAILABLE"
-        ) from e
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="TOURNAMENT_UNDO_UNAVAILABLE") from e
     return BatchResult(affected=affected)
 
 
