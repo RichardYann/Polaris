@@ -10,7 +10,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile, status
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from redis.asyncio import Redis
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -41,6 +41,7 @@ from app.schemas.paper import (
     PaperMyMetaUpdate,
     PaperMyTagsRead,
     PaperMyTagsUpdate,
+    PaperPdfUrlCreate,
     PaperRead,
     PaperTagsUpdate,
     PaperUpdate,
@@ -626,6 +627,90 @@ async def fetch_paper_pdf(
     except papers_service.PdfFetchFailedError as e:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, detail="PDF_FETCH_FAILED") from e
     return await _paper_detail(session, view, user.id)
+
+
+async def _replace_pdf_and_launch(
+    *,
+    session: AsyncSession,
+    redis: Redis,
+    view: papers_service.PaperView,
+    user: User,
+    content: bytes,
+) -> PaperDetail:
+    await papers_service.replace_pdf_content(session, view.paper, content)
+    task_id = await paper_enrich_service.launch_paper_enrichment(
+        redis=redis,
+        paper_id=view.id,
+        user_id=user.id,
+        library_id=view.library_id,
+        project_id=view.project_id,
+    )
+    refreshed = await papers_service.get_paper_for_user(
+        session,
+        paper_id=view.id,
+        user_id=user.id,
+        with_concepts=True,
+        include_pool=True,
+    )
+    detail = await _paper_detail(session, refreshed, user.id)
+    return detail.model_copy(update={"task_id": task_id})
+
+
+@router.put("/papers/{paper_id}/pdf", response_model=PaperDetail)
+async def upload_paper_pdf(
+    paper_id: uuid.UUID,
+    file: UploadFile = File(...),
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(current_active_user),
+    redis: Redis = Depends(get_redis_dep),
+) -> PaperDetail:
+    """Upload or replace a PDF, then rebuild all PDF-derived artifacts in the background."""
+    from app.services.literature.pdf_source import MAX_PDF_BYTES, PdfValidationError
+
+    view = await _get_member_paper(session, paper_id, user, include_pool=True)
+    parts: list[bytes] = []
+    total = 0
+    try:
+        while chunk := await file.read(1024 * 1024):
+            total += len(chunk)
+            if total > MAX_PDF_BYTES:
+                raise HTTPException(
+                    status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="PDF_TOO_LARGE"
+                )
+            parts.append(chunk)
+    finally:
+        await file.close()
+    try:
+        return await _replace_pdf_and_launch(
+            session=session, redis=redis, view=view, user=user, content=b"".join(parts)
+        )
+    except PdfValidationError as e:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
+
+
+@router.post("/papers/{paper_id}/fetch-pdf-url", response_model=PaperDetail)
+async def fetch_paper_pdf_url(
+    paper_id: uuid.UUID,
+    data: PaperPdfUrlCreate,
+    session: AsyncSession = Depends(get_session),
+    user: User = Depends(current_active_user),
+    redis: Redis = Depends(get_redis_dep),
+) -> PaperDetail:
+    """Fetch a public PDF URL safely and install/replace it for this paper."""
+    from app.services.literature.pdf_source import (
+        PdfUrlFetchError,
+        PdfValidationError,
+        download_pdf_url,
+    )
+
+    view = await _get_member_paper(session, paper_id, user, include_pool=True)
+    try:
+        content = await download_pdf_url(data.url)
+        return await _replace_pdf_and_launch(
+            session=session, redis=redis, view=view, user=user, content=content
+        )
+    except (PdfUrlFetchError, PdfValidationError) as e:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(e)) from e
 
 
 # ---- 论文图片（docs/api-lit.md §6.5） ----

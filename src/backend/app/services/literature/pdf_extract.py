@@ -62,8 +62,13 @@ def figure_path(paper_id: str, index: int) -> Path:
 
 
 def save_pdf(paper_id: str, content: bytes) -> Path:
+    from app.services.literature.pdf_source import validate_pdf_bytes
+
+    validate_pdf_bytes(content)
     path = papers_dir() / f"{paper_id}.pdf"
-    path.write_bytes(content)
+    tmp = path.with_suffix(".pdf.tmp")
+    tmp.write_bytes(content)
+    tmp.replace(path)
     return path
 
 

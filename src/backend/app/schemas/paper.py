@@ -222,6 +222,12 @@ class PaperBatchIds(BaseModel):
     hard: bool = False
 
 
+class PaperPdfUrlCreate(BaseModel):
+    """通过公开 URL 补录或替换论文 PDF。"""
+
+    url: str = Field(min_length=8, max_length=4096)
+
+
 class PaperTagsUpdate(BaseModel):
     """整组覆盖论文标签；空数组=清空。"""
 

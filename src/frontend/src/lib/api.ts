@@ -3307,6 +3307,16 @@ export const api = {
   requestPaperPdf(id: string): Promise<PaperDetail> {
     return request<PaperDetail>(`/papers/${id}/fetch-pdf`, { method: 'POST' });
   },
+  /** 上传并替换 PDF；服务端随后后台重建全文、图片和分块。 */
+  uploadPaperPdf(id: string, file: File): Promise<PaperDetail> {
+    const form = new FormData();
+    form.append('file', file);
+    return request<PaperDetail>(`/papers/${id}/pdf`, { method: 'PUT', body: form });
+  },
+  /** 通过公开 PDF URL 补录或替换。 */
+  fetchPaperPdfUrl(id: string, url: string): Promise<PaperDetail> {
+    return requestJson<PaperDetail>(`/papers/${id}/fetch-pdf-url`, 'POST', { url });
+  },
 
   // —— Lit · 论文图片（docs/api-lit.md §6.5） ——
   /** 论文图片元数据列表；无图返回 []。 */

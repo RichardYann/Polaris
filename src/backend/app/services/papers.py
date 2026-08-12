@@ -30,6 +30,7 @@ from app.models.library_direction import LibraryPaper
 from app.models.paper import (
     Concept,
     Paper,
+    PaperChunk,
     PaperNote,
     PaperTag,
     PaperUserMeta,
@@ -1043,6 +1044,22 @@ async def fetch_pdf(
     except Exception:  # noqa: BLE001
         logger.warning("chunk embed failed for paper %s", paper.id, exc_info=True)
     await session.refresh(paper)
+    return paper
+
+
+async def replace_pdf_content(session: AsyncSession, paper: Paper, content: bytes) -> Paper:
+    """Atomically install/replace a PDF and invalidate all PDF-derived artifacts."""
+    from app.services.literature.pdf_extract import figures_dir, papers_dir, save_pdf
+
+    txt_path = papers_dir() / f"{paper.id}.txt"
+    if txt_path.exists():
+        txt_path.unlink()
+    shutil.rmtree(figures_dir(str(paper.id)), ignore_errors=True)
+    await session.execute(delete(PaperChunk).where(PaperChunk.paper_id == paper.id))
+    paper.pdf_path = str(save_pdf(str(paper.id), content))
+    paper.full_text_path = None
+    paper.figures = None
+    await session.commit()
     return paper
 
 
