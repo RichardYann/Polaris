@@ -1409,6 +1409,28 @@ async def test_probe_failure_does_not_block_fetching(client, monkeypatch):
     assert fresh is True and seen is None
 
 
+async def test_probe_failure_in_later_category_does_not_block_fetching(client, monkeypatch):
+    """第一分类正常也不能掩盖后续分类失败；未知内容交给正式抓取处理。"""
+    from app.core.db import get_sessionmaker
+    from app.services import daily_feed
+
+    class _LaterCategoryBroken(_StubArxiv):
+        async def fetch_new(self, category: str):
+            if category == "cs.CV":
+                raise RuntimeError("later category unavailable")
+            return await super().fetch_new(category)
+
+    await register_and_login(client)
+    monkeypatch.setattr(
+        daily_feed,
+        "get_arxiv_client",
+        lambda: _LaterCategoryBroken({"cs.AI": [], "cs.RO": []}),
+    )
+    async with get_sessionmaker()() as session:
+        fresh, seen = await daily_feed.todays_batch_available(session)
+    assert fresh is True and seen is None
+
+
 async def test_retention_defaults_to_two_weeks_and_is_configurable(client):
     """保留期默认 14 天，管理员可改。
 
@@ -1757,3 +1779,87 @@ async def test_probe_says_no_when_everything_is_already_in_the_pool(client, monk
         fresh, _ = await daily_feed.todays_batch_available(session)
     assert fresh is False
 
+
+async def test_probe_checks_all_categories_when_first_category_is_old(client, monkeypatch):
+    """各分类 RSS 更新不同步时，后续分类的新论文也必须触发正式抓取。"""
+    from app.core.db import get_sessionmaker
+    from app.services import daily_feed
+
+    assert await register_and_login(client)
+    calls: list[str] = []
+
+    class _RecordingStub(_StubArxiv):
+        async def fetch_new(self, category: str):
+            calls.append(category)
+            return await super().fetch_new(category)
+
+    monkeypatch.setattr(
+        daily_feed,
+        "get_arxiv_client",
+        lambda: _RecordingStub(
+            {
+                "cs.AI": [_rss_entry("2608.91001", "第一分类已经收过")],
+                "cs.CV": [
+                    _rss_entry("2608.91002", "第二分类的新论文"),
+                    _rss_entry("2608.91003", "跨分类重复论文"),
+                ],
+                "cs.RO": [_rss_entry("2608.91003", "跨分类重复论文")],
+            }
+        ),
+    )
+    async with get_sessionmaker()() as session:
+        await daily_feed.set_categories(session, ["cs.AI", "cs.CV", "cs.RO"])
+        await daily_feed.upsert_entries(
+            session,
+            by_category={"cs.AI": [_rss_entry("2608.91001", "第一分类已经收过")]},
+        )
+        fresh, _ = await daily_feed.todays_batch_available(session)
+    assert fresh is True
+    assert calls == ["cs.AI", "cs.CV"], "第二分类发现新 ID 后不应继续请求 cs.RO"
+
+
+async def test_probe_stops_after_first_category_has_fresh_id(client, monkeypatch):
+    """第一分类已有新 ID 时直接允许建任务，避免不必要的后续 RSS 请求。"""
+    from app.core.db import get_sessionmaker
+    from app.services import daily_feed
+
+    calls: list[str] = []
+
+    class _RecordingStub(_StubArxiv):
+        async def fetch_new(self, category: str):
+            calls.append(category)
+            return await super().fetch_new(category)
+
+    assert await register_and_login(client)
+    monkeypatch.setattr(
+        daily_feed,
+        "get_arxiv_client",
+        lambda: _RecordingStub(
+            {
+                "cs.AI": [_rss_entry("2608.91011", "第一分类的新论文")],
+                "cs.CV": [_rss_entry("2608.91012", "不应被请求")],
+            }
+        ),
+    )
+    async with get_sessionmaker()() as session:
+        await daily_feed.set_categories(session, ["cs.AI", "cs.CV", "cs.RO"])
+        fresh, _ = await daily_feed.todays_batch_available(session)
+    assert fresh is True
+    assert calls == ["cs.AI"]
+
+
+async def test_probe_checks_every_category_before_saying_batch_is_empty(client, monkeypatch):
+    """只有全部订阅分类都为空，才可判定当前没有可抓取内容。"""
+    from app.core.db import get_sessionmaker
+    from app.services import daily_feed
+
+    assert await register_and_login(client)
+    monkeypatch.setattr(
+        daily_feed,
+        "get_arxiv_client",
+        lambda: _StubArxiv({"cs.AI": [], "cs.CV": [], "cs.RO": []}),
+    )
+    async with get_sessionmaker()() as session:
+        fresh, declared = await daily_feed.todays_batch_available(session)
+    assert fresh is False
+    assert declared == dt.datetime.now(dt.UTC).date().isoformat()

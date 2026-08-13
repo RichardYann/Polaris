@@ -1533,31 +1533,39 @@ async def todays_batch_available(session: AsyncSession) -> tuple[bool, str | Non
     categories = await get_categories(session)
     if not categories:
         return True, None
-    try:
-        entries, batch_at = await get_arxiv_client().fetch_new(categories[0])
-    except Exception:  # noqa: BLE001 — 探测失败不下结论，交给正式抓取去报错
-        logger.warning("daily feed probe failed", exc_info=True)
-        return True, None
-
-    declared = batch_at.astimezone(dt.UTC).date().isoformat() if batch_at else None
-    arxiv_ids = [str(e.get("arxiv_id")) for e in entries if e.get("arxiv_id")]
-    if not arxiv_ids:
-        # 一条都没有：周末/节假日的正常形态，没什么可收的
-        return False, declared
-
-    known = set(
-        (
-            await session.execute(
-                select(Paper.arxiv_id)
-                .join(DailyFeedEntry, DailyFeedEntry.paper_id == Paper.id)
-                .where(Paper.arxiv_id.in_(arxiv_ids))
+    client = get_arxiv_client()
+    batch_dates: list[dt.date] = []
+    for category in categories:
+        try:
+            entries, batch_at = await client.fetch_new(category)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — 任一分类探测失败都不能阻断正式抓取
+            logger.warning("daily feed probe failed for %s", category, exc_info=True)
+            return True, None
+        if batch_at:
+            batch_dates.append(batch_at.astimezone(dt.UTC).date())
+        arxiv_ids = {str(e["arxiv_id"]) for e in entries if e.get("arxiv_id")}
+        if not arxiv_ids:
+            continue
+        known = set(
+            (
+                await session.execute(
+                    select(Paper.arxiv_id)
+                    .join(DailyFeedEntry, DailyFeedEntry.paper_id == Paper.id)
+                    .where(Paper.arxiv_id.in_(list(arxiv_ids)))
+                )
             )
+            .scalars()
+            .all()
         )
-        .scalars()
-        .all()
-    )
-    fresh = any(aid not in known for aid in arxiv_ids)
-    return fresh, declared
+        if arxiv_ids - known:
+            declared = batch_at.astimezone(dt.UTC).date().isoformat() if batch_at else None
+            return True, declared
+
+    # 所有分类都成功检查，且每个分类都为空或全部已入池。
+    declared = max(batch_dates).isoformat() if batch_dates else None
+    return False, declared
 
 
 # ---- 保留期（可配置） ----
