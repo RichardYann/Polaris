@@ -121,7 +121,7 @@ export interface PapersTabProps {
 
 /* ---------------- 添加文献 Modal ---------------- */
 
-type ImportMethod = 'arxiv' | 'doi' | 'bibtex';
+type ImportMethod = 'arxiv' | 'doi' | 'corpus' | 'bibtex';
 
 /** 按 BibTeX 条目的配对大括号/圆括号切分，保留坏条目交给后端逐项报错。 */
 function splitBibtexEntries(raw: string): string[] {
@@ -188,6 +188,7 @@ function AddPaperModal({
   const [method, setMethod] = useState<ImportMethod>('arxiv');
   const [arxivId, setArxivId] = useState('');
   const [doi, setDoi] = useState('');
+  const [corpusId, setCorpusId] = useState('');
   const [bibtex, setBibtex] = useState('');
   const [parseError, setParseError] = useState<string | null>(null);
   const [progress, setProgress] = useState<{ taskId: string; total: number } | null>(null);
@@ -200,13 +201,15 @@ function AddPaperModal({
   const batchItems = useMemo<PaperBatchImportInput['items']>(() => {
     if (method === 'arxiv') return splitPaperInput(arxivId).map((value) => ({ arxiv_id: value }));
     if (method === 'doi') return splitPaperInput(doi).map((value) => ({ doi: value }));
+    if (method === 'corpus') return splitPaperInput(corpusId).map((value) => ({ corpus_id: value }));
     return splitBibtexEntries(bibtex).map((value) => ({ bibtex: value }));
-  }, [arxivId, bibtex, doi, method]);
+  }, [arxivId, bibtex, corpusId, doi, method]);
   const tooMany = batchItems.length > 50;
 
   const reset = () => {
     setArxivId('');
     setDoi('');
+    setCorpusId('');
     setBibtex('');
     setParseError(null);
   };
@@ -273,6 +276,7 @@ function AddPaperModal({
         options={[
           { v: 'arxiv', label: 'arXiv ID' },
           { v: 'doi', label: 'DOI' },
+          { v: 'corpus', label: 'Corpus ID' },
           { v: 'bibtex', label: tr('BibTeX 粘贴', 'Paste BibTeX') },
         ]}
         value={method}
@@ -315,6 +319,25 @@ function AddPaperModal({
             />
             <div className="muted" style={{ fontSize: 11.5, marginTop: 8, lineHeight: 1.6 }}>
               {tr('适合期刊 / 会议论文；最多 50 篇。', 'Best for journal and conference papers; up to 50.')}
+            </div>
+          </>
+        ) : method === 'corpus' ? (
+          <>
+            <textarea
+              className="textarea mono"
+              style={{ width: '100%', minHeight: 112, resize: 'vertical', fontSize: 12 }}
+              placeholder={tr(
+                '多个 Semantic Scholar Corpus ID 可用空格、逗号或换行分隔\n13756489, CorpusId:215416146',
+                'Separate Semantic Scholar Corpus IDs with spaces, commas, or new lines\n13756489, CorpusId:215416146',
+              )}
+              value={corpusId}
+              onChange={(e) => {
+                setCorpusId(e.target.value);
+                setParseError(null);
+              }}
+            />
+            <div className="muted" style={{ fontSize: 11.5, marginTop: 8, lineHeight: 1.6 }}>
+              {tr('支持纯数字或 CorpusId: 前缀；最多 50 篇。', 'Numeric IDs and the CorpusId: prefix are supported; up to 50.')}
             </div>
           </>
         ) : (

@@ -877,6 +877,7 @@ async def add_library_paper_manually(
             library=library,
             arxiv_id=data.arxiv_id,
             doi=data.doi,
+            corpus_id=data.corpus_id,
             bibtex=data.bibtex,
             project_id=library.project_id,
         )

@@ -908,7 +908,11 @@ export interface HighlightCreateInput {
 }
 
 /** 手动添加文献：三选一。 */
-export type PaperImportInput = { arxiv_id: string } | { doi: string } | { bibtex: string };
+export type PaperImportInput =
+  | { arxiv_id: string }
+  | { doi: string }
+  | { corpus_id: string }
+  | { bibtex: string };
 
 export interface PaperBatchImportInput {
   items: PaperImportInput[];
@@ -923,7 +927,7 @@ export type PaperBatchItemStatus = 'created' | 'existing' | 'invalid' | 'failed'
 
 export interface PaperBatchItemResult {
   index: number;
-  source: 'arxiv_id' | 'doi' | 'bibtex' | 'unknown';
+  source: 'arxiv_id' | 'doi' | 'corpus_id' | 'bibtex' | 'unknown';
   input: string;
   status: PaperBatchItemStatus;
   paper_id?: string;

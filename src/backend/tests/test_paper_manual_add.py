@@ -127,6 +127,55 @@ async def test_add_by_doi(client, lit_clients):
     assert body["url"] == "https://nature.example/landmark"
 
 
+async def test_add_by_semantic_scholar_corpus_id(client, monkeypatch):
+    from app.services import paper_import
+
+    class _SemanticScholar:
+        async def get_paper(self, paper_id):  # noqa: ANN001
+            assert paper_id == "CorpusId:13756489"
+            return {
+                "paperId": "s2-paper-id",
+                "title": "A Corpus Identified Paper",
+                "abstract": "Imported through Semantic Scholar.",
+                "year": 2024,
+                "publicationDate": "2024-05-06",
+                "venue": "Example Conference",
+                "url": "https://www.semanticscholar.org/paper/s2-paper-id",
+                "externalIds": {"DOI": "10.1000/corpus", "ArXiv": "2405.00001"},
+                "authors": [{"name": "Ada Researcher"}],
+            }
+
+    monkeypatch.setattr(paper_import, "get_s2_client", lambda: _SemanticScholar())
+    project_id, headers = await _setup(client)
+    resp = await client.post(
+        f"/api/projects/{project_id}/papers",
+        json={"corpus_id": "CorpusId:13756489"},
+        headers=headers,
+    )
+
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["title"] == "A Corpus Identified Paper"
+    assert body["arxiv_id"] == "2405.00001"
+    assert body["doi"] == "10.1000/corpus"
+    async with get_sessionmaker()() as session:
+        paper = await session.get(Paper, uuid.UUID(body["id"]))
+        assert paper.external_ids == {
+            "s2": "s2-paper-id",
+            "corpus_id": "13756489",
+            "arxiv": "2405.00001",
+            "doi": "10.1000/corpus",
+        }
+
+
+@pytest.mark.parametrize("value", ["", "0", "-1", "abc", "CorpusId:nope"])
+def test_invalid_corpus_id_is_rejected(value):
+    from app.services.paper_import import ParseFailedError, normalize_corpus_id
+
+    with pytest.raises(ParseFailedError):
+        normalize_corpus_id(value)
+
+
 async def test_add_by_bibtex_and_dedupe_by_doi(client):
     project_id, headers = await _setup(client)
     resp = await client.post(
@@ -300,6 +349,29 @@ async def test_batch_add_is_partial_and_reports_each_item(client, fake_redis):
         "event": "done",
         "data": {"total": 3, "created": 1, "existing": 1, "invalid": 1, "failed": 0},
     }
+
+
+async def test_batch_endpoint_preserves_corpus_id(client, monkeypatch):
+    from app.services import paper_enrich
+
+    captured: dict[str, object] = {}
+
+    async def _launch(**kwargs):  # noqa: ANN003
+        captured.update(kwargs)
+        return "corpus-batch-task"
+
+    monkeypatch.setattr(paper_enrich, "launch_paper_batch_import", _launch)
+    project_id, headers = await _setup(client)
+    resp = await client.post(
+        f"/api/projects/{project_id}/paper-imports/batch",
+        json={"items": [{"corpus_id": "13756489"}]},
+        headers=headers,
+    )
+
+    assert resp.status_code == 202, resp.text
+    assert captured["items"] == [
+        {"arxiv_id": None, "doi": None, "corpus_id": "13756489", "bibtex": None}
+    ]
 
 
 async def test_library_batch_add_endpoint_and_limit(client, fake_redis):

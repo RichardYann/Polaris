@@ -395,7 +395,7 @@ async def _run_enrichment(
 
 
 def _batch_input_summary(item: dict[str, Any]) -> tuple[str, str]:
-    for source in ("arxiv_id", "doi", "bibtex"):
+    for source in ("arxiv_id", "doi", "corpus_id", "bibtex"):
         value = item.get(source)
         if value:
             compact = " ".join(str(value).split())
@@ -444,6 +444,7 @@ async def _run_batch_import(
                             library=library,
                             arxiv_id=item.get("arxiv_id"),
                             doi=item.get("doi"),
+                            corpus_id=item.get("corpus_id"),
                             bibtex=item.get("bibtex"),
                             project_id=project_id,
                         )

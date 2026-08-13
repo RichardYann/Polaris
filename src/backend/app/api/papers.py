@@ -232,6 +232,7 @@ async def add_paper_manually(
             project_id=project_id,
             arxiv_id=data.arxiv_id,
             doi=data.doi,
+            corpus_id=data.corpus_id,
             bibtex=data.bibtex,
         )
     except paper_import_service.DuplicatePaperError as e:
