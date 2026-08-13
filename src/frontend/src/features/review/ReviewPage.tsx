@@ -539,6 +539,7 @@ function MatchesTab({
 
 export function ReviewPage() {
   const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
   const { isLoading: projectsLoading, currentProject, currentProjectId } = useProject();
   const pid = currentProjectId;
@@ -580,6 +581,15 @@ export function ReviewPage() {
   });
   const rows = leaderboardQuery.data ?? [];
 
+  const tournamentQuery = useQuery({
+    queryKey: ['latest-tournament', pid],
+    queryFn: () => api.getLatestTournamentSummary(pid!),
+    enabled: !!pid,
+    retry: false,
+    refetchInterval: runningVoyage ? 5_000 : false,
+  });
+  const latestTournament = tournamentQuery.data ?? null;
+
   // 晋级按钮 owner 可见：项目 owner 或平台 admin；成员信息缺失时放行（后端仍会校验）
   const { data: me } = useQuery({ queryKey: ['me'], queryFn: () => api.me(), retry: false, staleTime: 60_000 });
   const members = currentProject?.members;
@@ -587,6 +597,21 @@ export function ReviewPage() {
     isAdmin(me) ||
     !members ||
     members.some((m) => m.role === 'owner' && ((me?.id && m.user_id === me.id) || (me?.email && m.email === me.email)));
+
+  const retryMutation = useMutation({
+    mutationFn: () => api.retryFailedTournamentMatches(pid!),
+    onSuccess: (voyage) => {
+      toast(tr('失败对局补赛已开始', 'Failed-match retry started'), 'ok');
+      void queryClient.invalidateQueries({ queryKey: ['latest-tournament', pid] });
+      void queryClient.invalidateQueries({ queryKey: ['forge-state', pid] });
+      navigate(`/voyages/${voyage.id}`);
+    },
+    onError: (e) =>
+      toast(
+        `${tr('补赛启动失败', 'Failed to start retry')}：${e instanceof Error ? e.message : String(e)}`,
+        'error',
+      ),
+  });
 
   return (
     <div className="page fadeup" style={{ maxWidth: 1280 }}>
@@ -620,6 +645,37 @@ export function ReviewPage() {
               voyage {runningVoyage.slice(0, 8)}…
             </span>
             <Icon name="arrow" size={14} style={{ color: 'var(--accent-text)' }} />
+          </div>
+        </div>
+      )}
+
+      {!runningVoyage && latestTournament && latestTournament.failed > 0 && (
+        <div
+          className="card card-pad"
+          style={{ marginBottom: 16, borderColor: 'var(--warn)', background: 'var(--warn-bg)' }}
+        >
+          <div className="row gap10">
+            <Icon name="x" size={15} style={{ color: 'var(--warn)' }} />
+            <span style={{ fontSize: 13, fontWeight: 650 }}>
+              {tr(
+                `最新一轮部分完成：成功 ${latestTournament.completed}/${latestTournament.planned}，${latestTournament.failed} 场待补赛`,
+                `Latest round partially completed: ${latestTournament.completed}/${latestTournament.planned} succeeded; ${latestTournament.failed} need retry`,
+              )}
+            </span>
+            {latestTournament.can_retry && (
+              <button
+                className="btn btn-soft sm"
+                style={{ marginLeft: 'auto' }}
+                disabled={retryMutation.isPending}
+                onClick={() => retryMutation.mutate()}
+              >
+                <Icon name="refresh" size={13} />
+                {tr(
+                  `补跑失败对局（${latestTournament.failed}）`,
+                  `Retry failed matches (${latestTournament.failed})`,
+                )}
+              </button>
+            )}
           </div>
         </div>
       )}

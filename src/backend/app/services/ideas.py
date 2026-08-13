@@ -55,6 +55,10 @@ class InvalidSeedError(Exception):
     """深耕种子引用的 concept/paper/idea 不存在或不属于本项目。"""
 
 
+class TournamentRetryUnavailableError(Exception):
+    """The latest tournament is running, fully successful, or has invalid participants."""
+
+
 # ---- voyage 创建 ----
 
 
@@ -74,6 +78,11 @@ async def find_running_idea_voyage(
     return (await session.execute(stmt)).scalar_one_or_none()
 
 
+async def _lock_project_idea_creation(session: AsyncSession, project_id: uuid.UUID) -> None:
+    """Serialize idea voyage creation so retry requests cannot create duplicate runs."""
+    await session.execute(select(Project.id).where(Project.id == project_id).with_for_update())
+
+
 async def create_forge_voyage(
     session: AsyncSession,
     *,
@@ -82,6 +91,7 @@ async def create_forge_voyage(
     created_by: uuid.UUID | None,
 ) -> VoyageRun:
     """建 idea_forge voyage（forge/review 互斥 + Activity 落记录），由调用方入队 run_voyage。"""
+    await _lock_project_idea_creation(session, project.id)
     if await find_running_idea_voyage(session, project.id) is not None:
         raise IdeaVoyageConflictError(str(project.id))
     run = VoyageRun(
@@ -117,6 +127,7 @@ async def create_tournament_voyage(
     created_by: uuid.UUID | None,
 ) -> VoyageRun:
     """建 idea_review（辩论锦标赛）voyage；参与者不足 2 个抛 NotEnoughIdeasError。"""
+    await _lock_project_idea_creation(session, project.id)
     if await find_running_idea_voyage(session, project.id) is not None:
         raise IdeaVoyageConflictError(str(project.id))
 
@@ -166,6 +177,141 @@ async def create_tournament_voyage(
             kind="review.started",
             message=f"Idea 评审锦标赛已启动（{participant_count} 个想法）",
             payload=params,
+        )
+    )
+    await session.commit()
+    await session.refresh(run)
+    return run
+
+
+def _review_pair_key(idea_a: str, idea_b: str) -> tuple[str, str]:
+    return (idea_a, idea_b) if idea_a < idea_b else (idea_b, idea_a)
+
+
+def _failed_review_pairs(run: VoyageRun) -> list[list[str]]:
+    checkpoint = run.checkpoint or {}
+    planned = checkpoint.get("review_pairs") or []
+    results = checkpoint.get("review_results") or []
+    completed = {
+        _review_pair_key(str(result.get("idea_a")), str(result.get("idea_b")))
+        for result in results
+        if isinstance(result, dict) and result.get("idea_a") and result.get("idea_b")
+    }
+    return [
+        [str(pair[0]), str(pair[1])]
+        for pair in planned
+        if isinstance(pair, list)
+        and len(pair) == 2
+        and _review_pair_key(str(pair[0]), str(pair[1])) not in completed
+    ]
+
+
+async def latest_review_tournament(
+    session: AsyncSession, project_id: uuid.UUID
+) -> VoyageRun | None:
+    stmt = (
+        select(VoyageRun)
+        .where(VoyageRun.project_id == project_id, VoyageRun.kind == "idea_review")
+        .order_by(VoyageRun.created_at.desc())
+        .limit(1)
+    )
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+def review_tournament_summary(run: VoyageRun | None) -> dict[str, Any] | None:
+    if run is None:
+        return None
+    checkpoint = run.checkpoint or {}
+    params = checkpoint.get("params") or {}
+    planned = checkpoint.get("review_pairs") or []
+    results = checkpoint.get("review_results") or []
+    failed = _failed_review_pairs(run)
+    return {
+        "voyage_id": str(run.id),
+        "root_voyage_id": str(params.get("retry_of") or run.id),
+        "status": run.status,
+        "planned": len(planned),
+        "completed": len(results),
+        "failed": len(failed),
+        "is_retry": bool(params.get("retry_of")),
+        "can_retry": run.status in TERMINAL_STATUSES and bool(failed),
+    }
+
+
+async def create_retry_tournament_voyage(
+    session: AsyncSession,
+    *,
+    project: Project,
+    source: VoyageRun,
+    created_by: uuid.UUID | None,
+) -> VoyageRun:
+    """Create a supplement run containing only the source run's unfinished pairs."""
+    await _lock_project_idea_creation(session, project.id)
+    if await find_running_idea_voyage(session, project.id) is not None:
+        raise IdeaVoyageConflictError(str(project.id))
+    if source.project_id != project.id or source.kind != "idea_review":
+        raise TournamentRetryUnavailableError(str(source.id))
+    if source.status not in TERMINAL_STATUSES:
+        raise TournamentRetryUnavailableError(str(source.id))
+    failed_pairs = _failed_review_pairs(source)
+    if not failed_pairs:
+        raise TournamentRetryUnavailableError(str(source.id))
+
+    participant_ids = {uuid.UUID(idea_id) for pair in failed_pairs for idea_id in pair}
+    current_ids = {
+        idea_id
+        for (idea_id,) in (
+            await session.execute(
+                select(Idea.id).where(
+                    Idea.project_id == project.id,
+                    Idea.id.in_(participant_ids),
+                    Idea.trashed_at.is_(None),
+                )
+            )
+        ).all()
+    }
+    if current_ids != participant_ids:
+        raise TournamentRetryUnavailableError(str(source.id))
+
+    source_params = (source.checkpoint or {}).get("params") or {}
+    root_id = str(source_params.get("retry_of") or source.id)
+    params = {
+        "idea_ids": sorted(str(idea_id) for idea_id in participant_ids),
+        "rounds": int(source_params.get("rounds") or 2),
+        "personas": source_params.get("personas"),
+        "retry_pairs": failed_pairs,
+        "retry_of": root_id,
+        "retry_source": str(source.id),
+    }
+    matches = len(failed_pairs)
+    run = VoyageRun(
+        kind="idea_review",
+        goal=f"Idea 评审锦标赛补赛：{project.name}",
+        status="planning",
+        cursor=0,
+        checkpoint={"params": params},
+        budget={
+            "max_tokens": matches
+            * (2 * int(params["rounds"]) + 1)
+            * _TOKENS_PER_MATCH_CALL
+        },
+        project_id=project.id,
+        created_by=created_by,
+    )
+    session.add(run)
+    await session.flush()
+    session.add(
+        Activity(
+            project_id=project.id,
+            actor=f"user:{created_by}" if created_by else "system",
+            kind="review.retry_started",
+            message=f"Idea 锦标赛补赛已启动（{matches} 场待补）",
+            payload={
+                "voyage_id": str(run.id),
+                "root_voyage_id": root_id,
+                "source_voyage_id": str(source.id),
+                "matches": matches,
+            },
         )
     )
     await session.commit()
@@ -233,6 +379,7 @@ async def create_deep_voyage(
     created_by: uuid.UUID | None,
 ) -> VoyageRun:
     """建 idea_proposal voyage（深度生成，docs/api-idea2.md §2），由调用方入队 run_voyage。"""
+    await _lock_project_idea_creation(session, project.id)
     if await find_running_idea_voyage(session, project.id) is not None:
         raise IdeaVoyageConflictError(str(project.id))
     seed_brief = await _validate_seed(

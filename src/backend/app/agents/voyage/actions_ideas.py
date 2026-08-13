@@ -913,13 +913,49 @@ def _rounds(ctx: ActionContext) -> int:
         return DEFAULT_ROUNDS
 
 
+def _pair_key(idea_a: str, idea_b: str) -> tuple[str, str]:
+    return (idea_a, idea_b) if idea_a < idea_b else (idea_b, idea_a)
+
+
 @register("review.pair")
 async def review_pair(ctx: ActionContext, params: dict[str, Any]) -> dict[str, Any]:
     if isinstance(ctx.checkpoint.get("review_pairs"), list):  # 断点幂等
         return {"pairs": len(ctx.checkpoint["review_pairs"]), "skipped": True}
     explicit_ids = _params(ctx).get("idea_ids")
+    retry_pairs = _params(ctx).get("retry_pairs")
 
     async with get_sessionmaker()() as session:
+        if isinstance(retry_pairs, list):
+            pairs = [
+                [str(pair[0]), str(pair[1])]
+                for pair in retry_pairs
+                if isinstance(pair, list) and len(pair) == 2
+            ]
+            participant_ids = {idea_id for pair in pairs for idea_id in pair}
+            ideas = list(
+                (
+                    await session.execute(
+                        select(Idea).where(
+                            Idea.project_id == ctx.run.project_id,
+                            Idea.id.in_([uuid.UUID(i) for i in participant_ids]),
+                            Idea.trashed_at.is_(None),
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            if {str(i.id) for i in ideas} != participant_ids:
+                raise ValueError("retry participant missing or trashed")
+            ctx.checkpoint["review_pairs"] = pairs
+            return {
+                "participants": len(participant_ids),
+                "pairs": len(pairs),
+                "bye": None,
+                "retry": True,
+                "plan_signal": {"decision": "matches", "count": len(pairs)},
+            }
+
         stmt = select(Idea).where(
             Idea.project_id == ctx.run.project_id,
             Idea.trashed_at.is_(None),
@@ -1194,15 +1230,43 @@ async def review_match(ctx: ActionContext, params: dict[str, Any]) -> dict[str, 
 @register("review.summarize")
 async def review_summarize(ctx: ActionContext, params: dict[str, Any]) -> dict[str, Any]:
     results: list[dict[str, Any]] = list(ctx.checkpoint.get("review_results") or [])
+    planned_pairs: list[list[str]] = list(ctx.checkpoint.get("review_pairs") or [])
+    completed = {
+        _pair_key(str(result["idea_a"]), str(result["idea_b"]))
+        for result in results
+        if result.get("idea_a") and result.get("idea_b")
+    }
+    failed_pairs = [
+        pair
+        for pair in planned_pairs
+        if _pair_key(str(pair[0]), str(pair[1])) not in completed
+    ]
+    ctx.checkpoint["review_failed_pairs"] = failed_pairs
     async with get_sessionmaker()() as session:
         session.add(
             Activity(
                 project_id=ctx.run.project_id,
                 actor="agent:idea-review",
                 kind="review.completed",
-                message=f"Idea 评审锦标赛完成：{len(results)} 场辩论",
-                payload={"voyage_id": str(ctx.run.id), "matches": len(results)},
+                message=(
+                    f"Idea 评审锦标赛完成：{len(results)}/{len(planned_pairs)} 场成功"
+                    if failed_pairs
+                    else f"Idea 评审锦标赛完成：{len(results)} 场辩论"
+                ),
+                payload={
+                    "voyage_id": str(ctx.run.id),
+                    "matches": len(results),
+                    "planned": len(planned_pairs),
+                    "failed": len(failed_pairs),
+                },
             )
         )
         await session.commit()
-    return {"matches": len(results), "results": results}
+    return {
+        "matches": len(results),
+        "planned": len(planned_pairs),
+        "failed": len(failed_pairs),
+        "partial": bool(failed_pairs),
+        "failed_pairs": failed_pairs,
+        "results": results,
+    }
