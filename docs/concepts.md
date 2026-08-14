@@ -130,6 +130,41 @@ A run can also declare **done criteria** in the same check format, evaluated onc
 finished. If they fail, the run does not quietly declare victory: it asks the user whether to accept
 the result, keep going, or stop.
 
+## The MCP read-only tool layer
+
+Polaris's retrieval capabilities (concepts, literature, knowledge, project state, external search)
+are unified into a single registry of **read-only tools**. Tool definitions are the single source of
+truth: each is registered once and reused by two consumers.
+
+- **Internally**, the Voyage agent uses these tools during writing, review, idea building, and
+  literature analysis so the LLM can retrieve on demand mid-generation instead of receiving one
+  capped context up front.
+- **Externally**, an MCP protocol server exposes the same tools to MCP clients such as Claude
+  Desktop and Cursor. The user-scoped `list_accessible_projects` tool discovers the topics available
+  to the authenticated user before a project-scoped tool is called.
+
+The registry spans in-library search (papers, chunks, wiki, concepts, figures, and the knowledge
+graph), project state (ideas, experiments, and fact packs), the workspace itself (topic status, AI
+tasks and their logs, and pending approval gates), the corpus (direction libraries and the daily
+arXiv pool), manuscripts (file tree and contents), and external lookups (Semantic Scholar and
+OpenAlex search, references, citations, and DOI lookup). Figure tools can return inline images so
+external clients can pull method and experiment figures directly.
+
+The external server offers two transports:
+
+- **Streamable HTTP** at `POST /mcp`, authenticated with the platform JWT. Project-scoped tool calls
+  carry a `project_id`, and the server verifies the caller can access that project. The project
+  discovery tool derives its scope from the authenticated user and doesn't require a project ID.
+- **stdio** via `python -m app.mcp`, for local desktop clients, where an environment variable
+  identifies the user.
+
+Every tool is read-only. Project-scoped tools are topic-isolated: an ID from another topic reads as
+not found even when the caller can access it elsewhere. The user-scoped discovery tool returns only
+projects available to the authenticated user. Approval gates are visible but not decidable, so an
+agent can report that work is waiting for a human, but only the human can decide in the web app.
+
+See [MCP](mcp.md) for the connection guide and the full tool catalog.
+
 ## The persisted state machine
 
 ```mermaid
