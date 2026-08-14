@@ -46,6 +46,15 @@ def _make_engine() -> tuple[VoyageEngine, RecordingBus]:
     return VoyageEngine(event_bus=bus, llm_router=LLMRouter()), bus
 
 
+class _FailOnePairProvider(FakeProvider):
+    async def complete(self, messages, *, model, temperature=0.7, max_tokens=None):
+        if any("FAIL_PAIR" in message.content for message in messages):
+            raise RuntimeError("temporary upstream failure")
+        return await super().complete(
+            messages, model=model, temperature=temperature, max_tokens=max_tokens
+        )
+
+
 async def test_tournament_fans_out_per_match_nodes(client, queue_stub):
     """4 个 idea → 2 场对局：pair 展开 2 个 review.match 节点（每场可见、可逐场查预算），
     顺序 pair → match×2 → summarize，全部通过（docs/voyage-loop.md §7）。"""
@@ -100,6 +109,86 @@ async def test_tournament_excludes_trashed_ideas(client, queue_stub):
     )
     assert pair_observation["participants"] == 4
     assert pair_observation["pairs"] == 2
+
+
+async def test_partial_tournament_retries_only_failed_matches(client, queue_stub):
+    project_id, headers = await _setup_project(client, name="failed-match-retry")
+    idea_ids = [
+        await _seed_idea(project_id, "想法 A"),
+        await _seed_idea(project_id, "想法 B"),
+        await _seed_idea(project_id, "FAIL_PAIR 想法 C"),
+        await _seed_idea(project_id, "FAIL_PAIR 想法 D"),
+    ]
+    resp = await client.post(
+        f"/api/projects/{project_id}/review/tournament", json={"rounds": 1}, headers=headers
+    )
+    assert resp.status_code == 201, resp.text
+    router = LLMRouter()
+    router.override_provider(_FailOnePairProvider())
+    await VoyageEngine(event_bus=RecordingBus(), llm_router=router).run(
+        uuid.UUID(resp.json()["id"])
+    )
+
+    summary = (
+        await client.get(
+            f"/api/projects/{project_id}/review/tournament/latest", headers=headers
+        )
+    ).json()
+    assert summary["planned"] == 2
+    assert summary["completed"] == 1
+    assert summary["failed"] == 1
+    assert summary["can_retry"] is True
+
+    retry = await client.post(
+        f"/api/projects/{project_id}/review/tournament/retry-failed", headers=headers
+    )
+    assert retry.status_code == 201, retry.text
+    duplicate = await client.post(
+        f"/api/projects/{project_id}/review/tournament/retry-failed", headers=headers
+    )
+    assert duplicate.status_code == 409
+    assert duplicate.json()["detail"] == "IDEA_VOYAGE_ALREADY_RUNNING"
+
+    retry_engine, _ = _make_engine()
+    await retry_engine.run(uuid.UUID(retry.json()["id"]))
+    summary = (
+        await client.get(
+            f"/api/projects/{project_id}/review/tournament/latest", headers=headers
+        )
+    ).json()
+    assert summary["is_retry"] is True
+    assert summary["planned"] == 1
+    assert summary["completed"] == 1
+    assert summary["failed"] == 0
+    assert summary["can_retry"] is False
+
+    async with get_sessionmaker()() as session:
+        ideas = [await session.get(Idea, uuid.UUID(idea_id)) for idea_id in idea_ids]
+        assert all(idea is not None and idea.matches == 1 for idea in ideas)
+
+
+async def test_failed_match_retry_rejects_trashed_participant(client, queue_stub):
+    project_id, headers = await _setup_project(client, name="retry-trashed")
+    await _seed_idea(project_id, "想法 A")
+    await _seed_idea(project_id, "想法 B")
+    failed_a = await _seed_idea(project_id, "FAIL_PAIR 想法 C")
+    await _seed_idea(project_id, "FAIL_PAIR 想法 D")
+    resp = await client.post(
+        f"/api/projects/{project_id}/review/tournament", json={"rounds": 1}, headers=headers
+    )
+    router = LLMRouter()
+    router.override_provider(_FailOnePairProvider())
+    await VoyageEngine(event_bus=RecordingBus(), llm_router=router).run(
+        uuid.UUID(resp.json()["id"])
+    )
+    trashed = await client.delete(f"/api/ideas/{failed_a}", headers=headers)
+    assert trashed.status_code == 204, trashed.text
+
+    retry = await client.post(
+        f"/api/projects/{project_id}/review/tournament/retry-failed", headers=headers
+    )
+    assert retry.status_code == 409
+    assert retry.json()["detail"] == "TOURNAMENT_RETRY_UNAVAILABLE"
 
 
 async def test_tournament_debate_elo_and_leaderboard(client, queue_stub):

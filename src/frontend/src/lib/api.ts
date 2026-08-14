@@ -1759,6 +1759,17 @@ export interface LeaderboardRow extends IdeaRead {
   wins: number;
 }
 
+export interface TournamentSummary {
+  voyage_id: string;
+  root_voyage_id: string;
+  status: string;
+  planned: number;
+  completed: number;
+  failed: number;
+  is_retry: boolean;
+  can_retry: boolean;
+}
+
 /** idea_match = 一场辩论；idea_discussion = 常驻人机讨论区。 */
 export type ReviewTargetType = 'idea_match' | 'idea_discussion';
 
@@ -4093,6 +4104,14 @@ export const api = {
   },
   getLeaderboard(projectId: string): Promise<LeaderboardRow[]> {
     return request<LeaderboardRow[]>(`/projects/${projectId}/review/leaderboard`);
+  },
+  getLatestTournamentSummary(projectId: string): Promise<TournamentSummary | null> {
+    return request<TournamentSummary | null>(`/projects/${projectId}/review/tournament/latest`);
+  },
+  retryFailedTournamentMatches(projectId: string): Promise<VoyageRead> {
+    return request<VoyageRead>(`/projects/${projectId}/review/tournament/retry-failed`, {
+      method: 'POST',
+    });
   },
 
   // —— M3 · 讨论 / 辩论 session ——
