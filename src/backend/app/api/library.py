@@ -246,7 +246,11 @@ async def import_entry(
     """
     try:
         result = await paper_import_service.resolve_or_create_pool_paper(
-            session, arxiv_id=body.arxiv_id, doi=body.doi, bibtex=body.bibtex
+            session,
+            arxiv_id=body.arxiv_id,
+            doi=body.doi,
+            corpus_id=body.corpus_id,
+            bibtex=body.bibtex,
         )
     except paper_import_service.ParseFailedError as e:
         raise HTTPException(

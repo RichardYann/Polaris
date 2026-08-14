@@ -174,22 +174,25 @@ class PaperPdfUrlIn(BaseModel):
 
 
 class PaperManualCreate(BaseModel):
-    """手动添加文献：arxiv_id / doi / bibtex 三选一（docs/api-lit.md §4）。"""
+    """手动添加文献：arxiv_id / doi / corpus_id / bibtex 四选一。"""
 
     arxiv_id: str | None = None
     doi: str | None = None
+    corpus_id: str | None = None
     bibtex: str | None = None
 
     @model_validator(mode="after")
     def _exactly_one(self) -> "PaperManualCreate":
-        provided = [v for v in (self.arxiv_id, self.doi, self.bibtex) if v and v.strip()]
+        provided = [
+            v for v in (self.arxiv_id, self.doi, self.corpus_id, self.bibtex) if v and v.strip()
+        ]
         if len(provided) != 1:
-            raise ValueError("arxiv_id / doi / bibtex 必须且只能填一个")
+            raise ValueError("arxiv_id / doi / corpus_id / bibtex 必须且只能填一个")
         return self
 
 
 class PaperManualBatchCreate(BaseModel):
-    """批量手动添加文献；每项仍遵守三来源互斥规则。"""
+    """批量手动添加文献；每项仍遵守四来源互斥规则。"""
 
     items: list[PaperManualCreate] = Field(min_length=1, max_length=50)
 
