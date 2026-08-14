@@ -31,6 +31,11 @@ docker compose -f docker/docker-compose.yml -f docker/docker-compose.prod.yml up
 This builds the images, starts everything detached, and restarts services unless stopped. Routine
 updates only rebuild the pip/source layers of `api`/`worker`, which takes minutes.
 
+Speech synthesis is an external dependency, not part of the Polaris stack.
+Deploy an OpenAI Speech-compatible service separately, then configure its
+endpoint and model under **Manage > LLM admin > Speech model**. Polaris stores
+this configuration in the database, not in `.env`.
+
 ## Deploy from published images (no build)
 
 CI publishes `amd64` images to Docker Hub as `tricktreat/polaris-{api,worker,frontend}` on every

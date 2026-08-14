@@ -25,6 +25,8 @@ noted below.
 | `POLARIS_CHAT_AGENT_ENABLED` | Enable PolarisBuddy's multi-turn tool loop. Off by default because each round re-sends the conversation history and tool schemas, which costs far more than one-shot chat. | (unset), set `1` to enable |
 | `POLARIS_GITHUB_TOKEN` | GitHub PAT (repo scope) used by the in-app feedback feature to file issues. Empty disables issue creation (feedback still produces a draft). | (empty) |
 | `POLARIS_GITHUB_REPO` | Target `owner/name` repository for feedback issues. | `ZJU-REAL/Polaris` |
+| `POLARIS_PUBLIC_BASE_URL` | Public server root used to build stdio MCP download links. HTTP MCP always reuses the origin of its current `/mcp` request and ignores this setting. | (empty), for example, `https://polaris.example.edu` |
+| `POLARIS_MCP_DOWNLOAD_LINK_TTL_SECONDS` | Lifetime of signed paper-figure download links, in seconds. Values are limited to 60 seconds through 24 hours. | `900` |
 | `POLARIS_DATABASE_URL` | Async SQLAlchemy database URL. Falls back to local SQLite when unset, which enables a no-Docker quick start; production uses Postgres with asyncpg. | `postgresql+asyncpg://polaris:polaris@postgres:5432/polaris` (default when unset: `sqlite+aiosqlite:///./polaris_dev.db`) |
 | `POLARIS_DB_POOL_SIZE` / `POLARIS_DB_MAX_OVERFLOW` / `POLARIS_DB_POOL_TIMEOUT` | SQLAlchemy connection pool sizing. The defaults are tuned for the worker's concurrency (parallel scoring sessions per voyage); shrink them only if your Postgres `max_connections` is low. | `20` / `50` / `30` |
 | `POLARIS_REDIS_URL` | Redis URL for the ARQ broker and cache. | `redis://redis:6379/0` (local default `redis://localhost:6379/0`) |
@@ -36,6 +38,10 @@ noted below.
 | `POLARIS_DATA_DIR` | Directory for PDFs and generated artifacts. In containers this is set to `/srv/data` and bind-mounted; keep it out of the code tree. | `./data` (containers: `/srv/data`) |
 | `POLARIS_OUTBOUND_PROXY` | HTTP proxy for outbound literature API calls (arXiv, Semantic Scholar, OpenAlex) when direct access is unreliable. Not used for LLM or internal traffic. From inside Docker, reach a host proxy via `host.docker.internal`. | (empty), e.g. `http://host.docker.internal:7897` |
 | `POLARIS_PIP_INDEX_URL` | Optional pip mirror used on the remote experiment servers. | (empty), e.g. `https://pypi.tuna.tsinghua.edu.cn/simple` |
+
+Speech settings aren't environment variables. Configure the external endpoint,
+model, voice, speed, and per-segment limit under **Manage > LLM admin > Speech
+model**. Polaris stores the configuration in the database.
 
 > [!NOTE]
 > LLM provider keys are the initial seed. The provider keys and the model routing table can also be
@@ -98,7 +104,9 @@ Set these when invoking Docker Compose (not in `.env`); see [Deployment](deploym
 ## MCP stdio variable
 
 When running the external MCP server over stdio for a local desktop client
-(`python -m app.mcp`), the caller is identified by an environment variable rather than a JWT.
+(`python -m app.mcp`), the caller is identified by an environment variable
+rather than a JWT. Set `POLARIS_PUBLIC_BASE_URL` in the application settings
+table when you need figure tools to return absolute download URLs.
 
 | Variable | Purpose | Example |
 | --- | --- | --- |
