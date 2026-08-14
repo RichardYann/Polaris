@@ -36,6 +36,8 @@ from app.schemas.experiment import (
     ExperimentRunRead,
 )
 from app.services import ssh_exec
+from app.services.managed_commands import OperationContext, RepairScope
+from app.services.managed_ssh import ManagedCommandHandle
 from app.services.projects import in_my_projects
 
 logger = logging.getLogger("polaris.experiments")
@@ -72,6 +74,29 @@ def append_local_log(experiment_id: uuid.UUID | str, seq: int, text: str) -> Pat
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
         f.write(text)
+    return path
+
+
+def terminal_log_path(experiment_id: uuid.UUID | str) -> Path:
+    """Local mirror for raw stdout/stderr from every managed remote command."""
+    return Path(get_settings().data_dir) / "experiments" / str(experiment_id) / "terminal.log"
+
+
+def append_terminal_output(
+    experiment_id: uuid.UUID | str,
+    *,
+    operation: str,
+    stream: str,
+    text: str,
+) -> Path:
+    path = terminal_log_path(experiment_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    prefix = f"[{operation}][{stream}] "
+    with path.open("a", encoding="utf-8") as file:
+        for line in text.splitlines(keepends=True):
+            file.write(prefix + line)
+        if text and not text.endswith(("\n", "\r")):
+            file.write("\n")
     return path
 
 
@@ -397,6 +422,52 @@ async def resume_from_waiting_by_voyage(
     await session.commit()
     await session.refresh(experiment)
     return experiment
+
+
+async def stop_managed_command_by_voyage(
+    session: AsyncSession,
+    voyage_id: uuid.UUID,
+    handle_data: dict[str, Any],
+) -> bool:
+    """Stop exactly the attempt shown in a managed-command ask and verify it died."""
+    experiment = (
+        await session.execute(select(Experiment).where(Experiment.voyage_id == voyage_id))
+    ).scalar_one_or_none()
+    if experiment is None or experiment.credential_id is None:
+        return False
+    credential = await session.get(SSHCredential, experiment.credential_id)
+    context_data = handle_data.get("context")
+    if credential is None or not isinstance(context_data, dict):
+        return False
+    try:
+        context = OperationContext(
+            phase=str(context_data["phase"]),
+            operation=str(context_data["operation"]),
+            display_command=str(context_data["display_command"]),
+            target=str(context_data["target"]) if context_data.get("target") else None,
+            soft_timeout_seconds=context_data.get("soft_timeout_seconds"),
+            stall_timeout_seconds=context_data.get("stall_timeout_seconds"),
+            hard_timeout_seconds=context_data.get("hard_timeout_seconds"),
+            repair_scope=RepairScope(str(context_data.get("repair_scope") or "none")),
+        )
+        handle = ManagedCommandHandle(
+            operation_id=str(handle_data["operation_id"]),
+            attempt_id=str(handle_data["attempt_id"]),
+            context=context,
+            process_id=int(handle_data["process_id"]),
+            process_group_id=int(handle_data["process_group_id"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return False
+    executor = await ssh_exec.open_executor(
+        credential=credential,
+        exp_id=str(experiment.id),
+        project_id=experiment.project_id,
+    )
+    try:
+        return await executor.stop_managed_command(handle)
+    finally:
+        await executor.close()
 
 
 # ---- 取消 ----

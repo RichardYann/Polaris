@@ -220,6 +220,28 @@ async def answer_voyage_ask(
         raise HTTPException(
             status.HTTP_422_UNPROCESSABLE_ENTITY, detail="ANSWER_EMPTY"
         )
+    # Do not hold an ask-row write transaction while a remote stop and its
+    # independent SSH audit writes are in flight. Concurrent answers may both
+    # attempt this idempotent, attempt-scoped stop; the conditional UPDATE below
+    # still guarantees that only one answer is accepted.
+    if data.choice == "stop_remote":
+        payload = ask.payload if isinstance(ask.payload, dict) else {}
+        context = payload.get("context")
+        handle = context.get("handle") if isinstance(context, dict) else None
+        if payload.get("ask_kind") != "managed_command" or not isinstance(handle, dict):
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="STOP_REMOTE_NOT_ALLOWED",
+            )
+        stopped = await experiments_service.stop_managed_command_by_voyage(
+            session, run.id, handle
+        )
+        if not stopped:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                detail="REMOTE_OPERATION_STOP_NOT_CONFIRMED",
+            )
+
     # 条件 UPDATE 防并发双答（两个成员同时点回答只有一个生效）
     result = await session.execute(
         sa_update(VoyageMessage)
