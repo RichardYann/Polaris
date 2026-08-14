@@ -4230,6 +4230,9 @@ export const api = {
     const qs = params.toString();
     return request<ExperimentLogs>(`/experiments/${id}/logs${qs ? `?${qs}` : ''}`);
   },
+  getExperimentTerminalLogs(id: string, tail = 500): Promise<ExperimentLogs> {
+    return request<ExperimentLogs>(`/experiments/${id}/terminal-logs?tail=${tail}`);
+  },
   /** 单张实验图表 PNG（blob → objectURL 显示，模式同论文 figures）。 */
   fetchExperimentFigureImage(id: string, index: number): Promise<Blob> {
     return requestBlob(`/experiments/${id}/figures/${index}/image`);
