@@ -61,6 +61,9 @@ class Runner(Protocol):
     async def launch_setup(self) -> tuple[int, str]: ...
     async def launch_managed_setup(self) -> ManagedCommandHandle: ...
     async def prepare_managed(self) -> ManagedCommandHandle | None: ...
+    async def recover_managed_prepare(
+        self, snapshot: CommandSnapshot
+    ) -> ManagedCommandHandle | None: ...
     async def read_setup_exit(self) -> int | None: ...
     async def read_setup_log(self, tail_chars: int = 2000) -> str: ...
 
@@ -123,6 +126,7 @@ RemoteHostRunner = SSHExecutor
 # docker 相关字段的**严格白名单**（这些值来自 plan=LLM 产出，会拼进 docker 命令，必须防注入）。
 _IMAGE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/:@-]*$")  # docker 镜像引用合法字符
 _GPUS_RE = re.compile(r"^(all|\d+|device=[\d,]+)$")  # all | 计数 | device=0,1
+_GPU_MODES = frozenset({"auto", "gpus", "nvidia_runtime"})
 _SHM_RE = re.compile(r"^\d+[bkmgBKMG]?$")
 _MOUNT_RE = re.compile(r"^[\w./~:-]+$")  # 卷路径：字母数字与 . / ~ : - _（禁空格/分号等）
 _CONTAINER_WORKDIR = "/work"  # 实验工作目录在容器内的固定挂载点
@@ -134,6 +138,7 @@ class ContainerSpec:
 
     image: str
     gpus: str | None = None  # "all" | "device=0,1" | "2"(计数) | None(不透传 GPU)
+    gpu_mode: str = "auto"  # auto | gpus | nvidia_runtime
     shm_size: str = "16g"
     # host→容器 的额外只读/读写卷（模型/数据集等，默认把 ~/hf 挂进去）。
     mounts: dict[str, str] = field(default_factory=lambda: {"~/hf": "/hf:ro"})
@@ -153,6 +158,11 @@ def parse_container_spec(data: Any) -> ContainerSpec | None:
         return None
     gpus_raw = str(data.get("gpus") or "").strip()
     gpus = gpus_raw if gpus_raw and _GPUS_RE.match(gpus_raw) else None
+    if gpus and gpus.isdigit() and not 1 <= int(gpus) <= 256:
+        gpus = None
+    gpu_mode = str(data.get("gpu_mode") or "auto").strip().lower()
+    if gpu_mode not in _GPU_MODES:
+        gpu_mode = "auto"
     shm_raw = str(data.get("shm_size") or "").strip()
     shm = shm_raw if shm_raw and _SHM_RE.match(shm_raw) else "16g"
     mounts: dict[str, str] = {}
@@ -164,7 +174,9 @@ def parse_container_spec(data: Any) -> ContainerSpec | None:
                 mounts[h] = c
     if not mounts:
         mounts = {"~/hf": "/hf:ro"}
-    return ContainerSpec(image=image, gpus=gpus, shm_size=shm, mounts=mounts)
+    return ContainerSpec(
+        image=image, gpus=gpus, gpu_mode=gpu_mode, shm_size=shm, mounts=mounts
+    )
 
 
 class ContainerRunner(SSHExecutor):
@@ -221,19 +233,79 @@ class ContainerRunner(SSHExecutor):
     def _dexec_workdir(self, inner: str) -> str:
         return self._dexec(f"cd {self._spec.workdir_mount} && {inner}")
 
-    def _docker_run_cmd(self) -> str:
+    @staticmethod
+    def _gpu_error_requires_legacy(text: str) -> bool:
+        lowered = text.lower()
+        explicit_runtime_failure = (
+            "nvidia-container-cli" in lowered
+            and (
+                "failed to add device rules" in lowered
+                or "devices.allow" in lowered
+                or "operation not permitted" in lowered
+            )
+        )
+        return explicit_runtime_failure or any(
+            marker in lowered
+            for marker in (
+                "unknown flag: --gpus",
+                "could not select device driver \"\" with capabilities: [[gpu]]",
+            )
+        )
+
+    @staticmethod
+    def _legacy_visible_devices(gpus: str | None) -> str | None:
+        if not gpus:
+            return None
+        if gpus == "all":
+            return "all"
+        if gpus.startswith("device="):
+            return gpus.removeprefix("device=")
+        if gpus.isdigit():
+            count = int(gpus)
+            if 1 <= count <= 256:
+                return ",".join(str(index) for index in range(count))
+        return None
+
+    def _docker_run_cmd(self, *, gpu_mode: str | None = None) -> str:
         spec = self._spec
+        mode = gpu_mode or spec.gpu_mode
         parts = ["docker run -d", f"--name {self._container_name}"]
-        if spec.gpus == "all" or (spec.gpus and spec.gpus.isdigit()):
-            parts.append(f"--gpus {spec.gpus}")
-        elif spec.gpus:  # device=0,1 —— docker 需要 --gpus '"device=0,1"'
-            parts.append(f"--gpus '\"{spec.gpus}\"'")
+        if spec.gpus and mode == "nvidia_runtime":
+            visible = self._legacy_visible_devices(spec.gpus)
+            if visible is None:
+                raise SSHExecError(f"无法把 GPU 规格转换为 NVIDIA_VISIBLE_DEVICES：{spec.gpus}")
+            parts.extend(
+                [
+                    "--runtime=nvidia",
+                    f"-e NVIDIA_VISIBLE_DEVICES={visible}",
+                    "-e NVIDIA_DRIVER_CAPABILITIES=all",
+                ]
+            )
+        elif spec.gpus and mode in {"auto", "gpus"}:
+            if spec.gpus == "all" or spec.gpus.isdigit():
+                parts.append(f"--gpus {spec.gpus}")
+            else:  # device=0,1 —— docker 需要 --gpus '\"device=0,1\"'
+                parts.append(f"--gpus '\"{spec.gpus}\"'")
         parts.append(f"--shm-size {spec.shm_size}")
         for host_path, ctr_path in spec.mounts.items():
             parts.append(f"-v {host_path}:{ctr_path}")
         parts.append(f"-v {self.workdir}:{spec.workdir_mount}")  # host workdir ←→ /work
         parts.append(f"-w {spec.workdir_mount} {spec.image} tail -f /dev/null")
         return " ".join(parts)
+
+    async def _has_nvidia_runtime(self) -> bool:
+        result = await self._run(
+            "docker info --format '{{json .Runtimes}}' 2>/dev/null"
+        )
+        return result.exit_status == 0 and '"nvidia"' in (result.stdout or "")
+
+    async def _legacy_retry_allowed(self, text: str) -> bool:
+        return (
+            self._spec.gpus is not None
+            and self._spec.gpu_mode == "auto"
+            and self._gpu_error_requires_legacy(text)
+            and await self._has_nvidia_runtime()
+        )
 
     async def _ensure_container(self) -> None:
         """幂等：容器在跑就复用（断连重连友好）；否则清掉残留并重新 docker run。"""
@@ -244,7 +316,22 @@ class ContainerRunner(SSHExecutor):
         await self._run(f"docker rm -f {name} >/dev/null 2>&1 || true")
         res = await self._run(self._docker_run_cmd(), timeout=self.CONTAINER_START_TIMEOUT)
         if res.exit_status != 0:
-            detail = (res.stderr or res.stdout or "").strip()[:300]
+            first_detail = (res.stderr or res.stdout or "").strip()
+            if await self._legacy_retry_allowed(first_detail):
+                await self._run(f"docker rm -f {name} >/dev/null 2>&1 || true")
+                legacy = await self._run(
+                    self._docker_run_cmd(gpu_mode="nvidia_runtime"),
+                    timeout=self.CONTAINER_START_TIMEOUT,
+                )
+                if legacy.exit_status == 0:
+                    return
+                detail = (
+                    f"--gpus 失败：{first_detail[:1200]}\n"
+                    "--runtime=nvidia 失败："
+                    f"{(legacy.stderr or legacy.stdout or '').strip()[:1200]}"
+                )
+            else:
+                detail = first_detail[:1200]
             raise SSHExecError(f"docker run 启动容器失败：{detail}")
 
     async def prepare_managed(self) -> ManagedCommandHandle | None:
@@ -258,15 +345,52 @@ class ContainerRunner(SSHExecutor):
         await self._run(f"docker rm -f {name} >/dev/null 2>&1 || true")
         return await self.start_managed_command(
             OperationContext(
-                phase="environment.prepare",
+                phase=(
+                    "environment.prepare.nvidia_runtime"
+                    if self._spec.gpu_mode == "nvidia_runtime"
+                    else "environment.prepare.gpus"
+                    if self._spec.gpus
+                    else "environment.prepare"
+                ),
                 operation="environment-prepare",
-                display_command=f"start container from {self._spec.image}",
+                display_command=(
+                    f"start container from {self._spec.image} using nvidia runtime"
+                    if self._spec.gpus and self._spec.gpu_mode == "nvidia_runtime"
+                    else f"start container from {self._spec.image} using --gpus"
+                    if self._spec.gpus
+                    else f"start container from {self._spec.image}"
+                ),
                 target=self.host,
                 soft_timeout_seconds=600,
                 stall_timeout_seconds=900,
                 repair_scope=RepairScope.INFRASTRUCTURE,
             ),
             self._docker_run_cmd(),
+        )
+
+    async def recover_managed_prepare(
+        self, snapshot: CommandSnapshot
+    ) -> ManagedCommandHandle | None:
+        """Retry a failed auto GPU launch once using the legacy NVIDIA runtime."""
+        if not self._spec.gpus or snapshot.context.phase != "environment.prepare.gpus":
+            return None
+        evidence = "\n".join(
+            (snapshot.stdout_tail or "", snapshot.stderr_tail or "")
+        )
+        if not await self._legacy_retry_allowed(evidence):
+            return None
+        await self._run(f"docker rm -f {self._container_name} >/dev/null 2>&1 || true")
+        return await self.start_managed_command(
+            OperationContext(
+                phase="environment.prepare.nvidia_runtime",
+                operation="environment-prepare",
+                display_command=f"start container from {self._spec.image} using nvidia runtime",
+                target=self.host,
+                soft_timeout_seconds=600,
+                stall_timeout_seconds=900,
+                repair_scope=RepairScope.INFRASTRUCTURE,
+            ),
+            self._docker_run_cmd(gpu_mode="nvidia_runtime"),
         )
 
     # ---- 执行原语（改成容器内执行；镜像自带框架，故不建 venv、用镜像 python） ----

@@ -768,6 +768,11 @@ class SSHExecutor:
     async def prepare_managed(self) -> ManagedCommandHandle | None:
         return None
 
+    async def recover_managed_prepare(
+        self, snapshot: CommandSnapshot
+    ) -> ManagedCommandHandle | None:
+        return None
+
     async def read_setup_exit(self) -> int | None:
         result = await self._run(f"cat {self.workdir}/setup.exit 2>/dev/null")
         text = result.stdout.strip()

@@ -9,9 +9,11 @@ from types import SimpleNamespace
 
 from app.agents.voyage.actions_experiment import (
     _conditions_delta,
+    _merge_managed_prepare_failures,
     _proposal_context,
     validate_plan,
 )
+from app.services.managed_commands import FailureDomain, FailureReport, RepairScope
 
 
 def test_proposal_context_renders_for_proposal_depth():
@@ -70,6 +72,50 @@ def test_validate_plan_passes_through_conditions():
     assert conds[0]["role"] == "baseline" and conds[2]["role"] == "treatment"
     assert plan["eval_protocol"]["dataset"] == "MATH-500"
     assert plan["datasets"][0]["name"] == "HuggingFaceH4/MATH-500"
+
+
+def test_validate_plan_preserves_gpu_mode():
+    plan = validate_plan(
+        {
+            "hypotheses": [{"text": "h", "status": "testing"}],
+            "repro_strategy": "r",
+            "steps": ["a", "b", "c"],
+            "primary_metric": {"name": "loss", "direction": "minimize"},
+            "budget_estimate": {"gpu_hours": 1},
+            "container": {
+                "image": "my/image:1",
+                "gpus": "2",
+                "gpu_mode": "nvidia_runtime",
+            },
+        }
+    )
+    assert plan["container"]["gpu_mode"] == "nvidia_runtime"
+
+
+def test_merge_managed_prepare_failures_keeps_both_attempts():
+    fallback = FailureReport(
+        phase="environment.prepare.nvidia_runtime",
+        operation="environment-prepare",
+        command_display="start using nvidia runtime",
+        domain=FailureDomain.ENVIRONMENT,
+        exception_type="CommandExitError",
+        message="legacy failed",
+        repair_scope=RepairScope.INFRASTRUCTURE,
+        stderr_tail="legacy stderr",
+    )
+    merged = _merge_managed_prepare_failures(
+        fallback,
+        {
+            "message": "gpus failed",
+            "stdout_tail": "gpus stdout",
+            "stderr_tail": "gpus stderr",
+        },
+    )
+    assert "gpus failed" in merged.message
+    assert "legacy failed" in merged.message
+    assert "[initial --gpus]" in (merged.stderr_tail or "")
+    assert "gpus stderr" in (merged.stderr_tail or "")
+    assert "legacy stderr" in (merged.stderr_tail or "")
 
 
 def test_validate_plan_backward_compatible_without_conditions():

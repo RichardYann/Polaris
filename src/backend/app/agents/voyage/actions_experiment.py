@@ -186,6 +186,33 @@ def _restore_managed_handle(data: Any) -> ManagedCommandHandle | None:
     except (KeyError, TypeError, ValueError):
         return None
 
+
+def _merge_managed_prepare_failures(
+    report: FailureReport, initial_failure: Any
+) -> FailureReport:
+    """Keep evidence from both GPU launch modes when the fallback also fails."""
+    if not isinstance(initial_failure, dict):
+        return report
+    initial_message = str(initial_failure.get("message") or "unknown error")
+    initial_stdout = str(initial_failure.get("stdout_tail") or "")
+    initial_stderr = str(initial_failure.get("stderr_tail") or "")
+    report.cause_chain.insert(0, f"Initial --gpus launch: {initial_message}"[-8000:])
+    report.message = (
+        f"Initial --gpus launch failed: {initial_message}\n"
+        f"Legacy nvidia runtime retry failed: {report.message}"
+    )[-8000:]
+    if initial_stdout:
+        report.stdout_tail = (
+            f"[initial --gpus]\n{initial_stdout}\n\n"
+            f"[legacy nvidia runtime]\n{report.stdout_tail or ''}"
+        )[-8000:]
+    if initial_stderr:
+        report.stderr_tail = (
+            f"[initial --gpus]\n{initial_stderr}\n\n"
+            f"[legacy nvidia runtime]\n{report.stderr_tail or ''}"
+        )[-8000:]
+    return report
+
 METRIC_LINE_RE = re.compile(r"POLARIS_METRIC\s+(\{.*\})")
 _FIGURE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")  # 远端文件名白名单（防目录穿越）
 
@@ -203,7 +230,8 @@ PLAN_SYSTEM_PROMPT = """\
                    "n_examples": 100, "n_samples": 1},
  "datasets": [{"name": "HF数据集名或来源", "purpose": "test|corpus|train", "size_hint": "规模"}],
  "models": [{"ref": "HF模型名或本机绝对路径", "role": "eval|student|teacher|base"}],
- "container": {"image": "预置框架镜像", "gpus": "device=0,1", "shm_size": "16g"},
+ "container": {"image": "预置框架镜像", "gpus": "device=0,1",
+               "gpu_mode": "auto|gpus|nvidia_runtime", "shm_size": "16g"},
  "budget_estimate": {"gpu_hours": 2, "runs": 3}}
 约束：
 - **kind 先给实验归类**（决定平台怎么备环境/怎么跑）：
@@ -219,7 +247,9 @@ PLAN_SYSTEM_PROMPT = """\
   · 强化学习/on-policy/GRPO/PPO/蒸馏 → trl 或 verl 系镜像
     （如 `verlai/verl:vllm017.latest`，含 trl/vllm/peft）；
   · 监督微调/LoRA/SFT → LLaMA-Factory 镜像；· 纯评测/benchmark → 轻量镜像 + lm-eval-harness；
-  gpus 用 "device=0,1"（选卡）/"all"/"2"（计数）；不需要 GPU 或不需要重型框架时
+  gpus 用 "device=0,1"（选卡）/"all"/"2"（计数）；gpu_mode 默认 auto，先用 --gpus，
+  只有明确的 NVIDIA runtime 权限错误才自动尝试 --runtime=nvidia；也可明确指定 gpus 或
+  nvidia_runtime。不需要 GPU 或不需要重型框架时
   **省略 container**（走裸机 venv）。
 - primary_metric 必填：name 是评测代码 POLARIS_METRIC 输出的指标名（对照实验里应是主处理组或均值），
   direction 只能取 maximize / minimize；budget_estimate 是对象（至少含 gpu_hours）；
@@ -1337,6 +1367,7 @@ def validate_plan(data: Any) -> dict[str, Any]:
         out["container"] = {
             "image": spec.image,
             "gpus": spec.gpus,
+            "gpu_mode": spec.gpu_mode,
             "shm_size": spec.shm_size,
             "mounts": spec.mounts,
         }
@@ -2050,25 +2081,45 @@ async def experiment_setup(ctx: ActionContext, params: dict[str, Any]) -> dict[s
                     executor = cancelled.executor
                     return {"cancelled": True, "workdir": experiment.workdir}
                 if prepare_snapshot.exit_status != 0:
-                    report = failure_from_snapshot(prepare_snapshot)
-                    _plan, next_step = await _plan_failure_recovery(ctx, report)
-                    return {
-                        "workdir": experiment.workdir,
-                        "failure": report.to_dict(),
-                        "ask": {
-                            "ask_kind": "command_recovery",
-                            "question": (
-                                f"远端环境准备失败：{report.message[-500:]}\n\n"
-                                f"建议：{next_step}"
-                            ),
-                            "context": {"failure": report.to_dict(), "next_step": next_step},
-                            "options": [
-                                {"id": "retry", "zh": "重试环境准备", "en": "Retry setup"},
-                                {"id": "replan", "zh": "更换运行方案", "en": "Change plan"},
-                                {"id": "abort", "zh": "放弃实验", "en": "Give up"},
-                            ],
-                        },
-                    }
+                    initial_failure = ctx.checkpoint.get("managed_prepare_initial_failure")
+                    fallback_handle = await executor.recover_managed_prepare(prepare_snapshot)
+                    if fallback_handle is not None:
+                        initial_failure = failure_from_snapshot(prepare_snapshot).to_dict()
+                        ctx.checkpoint["managed_prepare_initial_failure"] = initial_failure
+                        try:
+                            prepare_snapshot, executor = await _monitor_managed_command(
+                                ctx, session, executor, experiment, fallback_handle
+                            )
+                        except ManagedCommandNeedsUser as pending:
+                            return _managed_command_waiting_result(ctx, experiment, pending)
+                        except ManagedCommandCancelled as cancelled:
+                            executor = cancelled.executor
+                            return {"cancelled": True, "workdir": experiment.workdir}
+                        if prepare_snapshot.exit_status == 0:
+                            ctx.checkpoint.pop("managed_prepare_initial_failure", None)
+                            resumed_handle = None
+                    if prepare_snapshot.exit_status != 0:
+                        report = failure_from_snapshot(prepare_snapshot)
+                        report = _merge_managed_prepare_failures(report, initial_failure)
+                        ctx.checkpoint.pop("managed_prepare_initial_failure", None)
+                        _plan, next_step = await _plan_failure_recovery(ctx, report)
+                        return {
+                            "workdir": experiment.workdir,
+                            "failure": report.to_dict(),
+                            "ask": {
+                                "ask_kind": "command_recovery",
+                                "question": (
+                                    f"远端环境准备失败：{report.message[-500:]}\n\n"
+                                    f"建议：{next_step}"
+                                ),
+                                "context": {"failure": report.to_dict(), "next_step": next_step},
+                                "options": [
+                                    {"id": "retry", "zh": "重试环境准备", "en": "Retry setup"},
+                                    {"id": "replan", "zh": "更换运行方案", "en": "Change plan"},
+                                    {"id": "abort", "zh": "放弃实验", "en": "Give up"},
+                                ],
+                            },
+                        }
                 resumed_handle = None
             while True:
                 attempts += 1
