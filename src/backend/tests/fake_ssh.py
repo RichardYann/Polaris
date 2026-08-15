@@ -7,6 +7,7 @@
 - ``on_command`` 钩子可在特定命令时机注入副作用（如把 voyage 置 cancelled）。
 """
 
+import base64
 import re
 import time
 from collections.abc import Awaitable, Callable
@@ -142,11 +143,18 @@ class FakeSSHSession:
             return SSHResult(0, "\n".join(rows) + "\n", "")
         if command.startswith("tail -c") and ".polaris/operations/" in command:
             path = command.split(" 2>/dev/null", 1)[0].split()[-1]
-            text = server.managed_files.get(path, "")
+            raw = server.managed_files.get(path, "").encode()
             offset_match = re.search(r"tail -c \+(\d+)", command)
             if offset_match:
-                text = text.encode()[int(offset_match.group(1)) - 1 :].decode()
-            return SSHResult(0, text, "")
+                raw = raw[int(offset_match.group(1)) - 1 :]
+            # 增量读取那条管道是 `tail -c +N | head -c CAP | base64 | tr -d '\n'`，
+            # 按字节截断后原样编码；快照的 `tail -c N` 走下面的原文分支。
+            head_match = re.search(r"\|\s*head -c (\d+)", command)
+            if head_match:
+                raw = raw[: int(head_match.group(1))]
+            if "base64" in command:
+                return SSHResult(0, base64.b64encode(raw).decode(), "")
+            return SSHResult(0, raw.decode(errors="replace"), "")
         if command.startswith("ps -o etimes="):
             return SSHResult(0, "1 00:00:01 S wait\n", "")
         if "kill -TERM -- -" in command:
