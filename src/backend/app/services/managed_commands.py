@@ -28,10 +28,22 @@ _REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
         r"\1[REDACTED]",
     ),
     (
+        # 名字以这些词结尾即算敏感：HF_TOKEN / AWS_SECRET_ACCESS_KEY / OPENAI_API_KEY…
+        # 不能只用 \b 起头——下划线是单词字符，\btoken 在 HF_TOKEN 里根本匹配不上，
+        # 而实验脚本里的密钥几乎全是这种带前缀的环境变量名。
         re.compile(
-            r"(?i)\b(api[_-]?key|token|password|passwd|secret)\s*[:=]\s*([^\s,;]+)"
+            r"(?i)([A-Za-z0-9_.-]*(?:api[_-]?key|access[_-]?key|token|password|passwd|secret)"
+            r"[A-Za-z0-9_.-]*)\s*[:=]\s*([^\s,;]+)"
         ),
         r"\1=[REDACTED]",
+    ),
+    (
+        # 常见的自带前缀密钥：OpenAI sk-…、GitHub ghp_/gho_/ghs_/github_pat_、HF hf_、Slack xox…
+        re.compile(
+            r"(?i)\b(sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}"
+            r"|github_pat_[A-Za-z0-9_]{20,}|hf_[A-Za-z0-9]{20,}|xox[abprs]-[A-Za-z0-9-]{10,})"
+        ),
+        "[REDACTED]",
     ),
     (
         re.compile(r"(?i)(--(?:api[_-]?key|token|password|secret)\s+)[^\s]+"),
@@ -135,7 +147,13 @@ class CommandSnapshot:
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
-        data["context"] = asdict(self.context)
+        context = asdict(self.context)
+        # display_command / target 同样可能带密钥（命令行里的 --token 等），
+        # 它们跟着快照一路进 API、前端和日志，必须和 tail 一样脱敏。
+        context["display_command"] = redact_text(context.get("display_command"))
+        if context.get("target"):
+            context["target"] = redact_text(context["target"])
+        data["context"] = context
         data["progress_token"] = self.progress_token
         data["stdout_tail"] = redact_text(self.stdout_tail, tail=True)
         data["stderr_tail"] = redact_text(self.stderr_tail, tail=True)
