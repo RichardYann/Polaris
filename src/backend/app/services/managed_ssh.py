@@ -7,6 +7,7 @@ not inspect command names and does not need per-command lifecycle adapters.
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import re
 import time
@@ -18,6 +19,9 @@ from typing import Protocol
 from app.services.managed_commands import CommandSnapshot, OperationContext, redact_text
 
 _OPERATION_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+# 单轮增量读取的上限：远端一次刷太多日志时只取这么多，剩下的下一轮接着读。
+_MAX_OUTPUT_CHUNK_BYTES = 262_144
 
 
 class SSHResultLike(Protocol):
@@ -129,9 +133,9 @@ class SSHManagedCommands:
         pgid: int | None = None
         for _ in range(10):
             with contextlib.suppress(Exception):
-                pid = await self._read_int(f"{prefix}.pid")
+                pid = await self._read_positive_int(f"{prefix}.pid")
                 if pid is not None:
-                    pgid = await self._read_int(f"{prefix}.pgid") or pid
+                    pgid = await self._read_positive_int(f"{prefix}.pgid") or pid
                     break
             await asyncio.sleep(0.1)
         pid = pid or fallback_pid
@@ -181,13 +185,13 @@ class SSHManagedCommands:
             current = await self.current_attempt_id(operation_id)
             if current is not None:
                 current_prefix = self._attempt_prefix(operation_id, current)
-                current_pid = await self._read_int(f"{current_prefix}.pid")
+                current_pid = await self._read_positive_int(f"{current_prefix}.pid")
                 current_exit = await self._read_int(f"{current_prefix}.exit")
                 if current_pid is not None and current_exit is None:
                     alive = await self._run(f"kill -0 {current_pid} 2>/dev/null", 60)
                     if alive.exit_status == 0:
                         current_pgid = (
-                            await self._read_int(f"{current_prefix}.pgid") or current_pid
+                            await self._read_positive_int(f"{current_prefix}.pgid") or current_pid
                         )
                         return ManagedCommandHandle(
                             operation_id=operation_id,
@@ -205,7 +209,12 @@ class SSHManagedCommands:
                 "ps -o pgid= -p $$ | tr -d ' ' > ${prefix}.pgid\n"
                 "date +%s > ${prefix}.started\n"
                 "touch ${prefix}.stdout ${prefix}.stderr\n"
-                f"{{ {command}; }} >${{prefix}}.stdout 2>${{prefix}}.stderr\n"
+                # 命令单独成行：写成 `{ cmd; }` 时，只要 cmd 以注释收尾
+                # （`bash run.sh # 说明`），后面的 `; }` 会被一起注释掉，
+                # 整个启动脚本变成语法错误。换行后注释只吃掉它自己那一行。
+                "{\n"
+                f"{command}\n"
+                "} >${prefix}.stdout 2>${prefix}.stderr\n"
                 "status=$?\n"
                 "printf '%s\\n' \"$status\" > ${prefix}.exit.tmp\n"
                 "mv ${prefix}.exit.tmp ${prefix}.exit\n"
@@ -295,6 +304,16 @@ class SSHManagedCommands:
         except (ValueError, IndexError):
             return None
 
+    async def _read_positive_int(self, path: str) -> int | None:
+        """读 pid / pgid 专用：非正数一律当读失败。
+
+        这些值会拼进 ``kill -- -<pgid>``。文件被截断或写坏时读出 0 / 负数，
+        再送进 kill 就不是"没杀成"而是打偏——0 指调用方自己的进程组，
+        -1 在 kill 语义里是"所有能签名的进程"。宁可当没读到，回退到 handle。
+        """
+        value = await self._read_int(path)
+        return value if value is not None and value > 0 else None
+
     async def snapshot(
         self,
         handle: ManagedCommandHandle,
@@ -303,8 +322,8 @@ class SSHManagedCommands:
         diagnostic_evidence: dict[str, str] | None = None,
     ) -> CommandSnapshot:
         prefix = self._attempt_prefix(handle.operation_id, handle.attempt_id)
-        pid = await self._read_int(f"{prefix}.pid") or handle.process_id
-        pgid = await self._read_int(f"{prefix}.pgid") or handle.process_group_id
+        pid = await self._read_positive_int(f"{prefix}.pid") or handle.process_id
+        pgid = await self._read_positive_int(f"{prefix}.pgid") or handle.process_group_id
         started = await self._read_int(f"{prefix}.started") or int(time.time())
         exit_status = await self._read_int(f"{prefix}.exit")
         alive_result = await self._run(f"kill -0 {pid} 2>/dev/null", 60)
@@ -379,15 +398,30 @@ class SSHManagedCommands:
         next_offsets: list[int] = []
         for stream, offset in (("stdout", stdout_offset), ("stderr", stderr_offset)):
             safe_offset = max(0, int(offset))
+            # 走 base64 拿字节：偏移量是字节口径，而 SSH 结果是解码后的 str。
+            # 直接用 len(text.encode()) 记账，遇到多字节字符被切断或非法 UTF-8
+            # （中文日志、带 unicode 的进度条都会）就会与真实消费字节数错位，
+            # 下一轮要么重复吐要么吞掉一段。head -c 同时给单轮读取封顶，
+            # 免得两次轮询之间刷了几百 MB 日志被整包拉回后端。
             result = await self._run(
-                f"tail -c +{safe_offset + 1} {prefix}.{stream} 2>/dev/null",
+                f"tail -c +{safe_offset + 1} {prefix}.{stream} 2>/dev/null "
+                f"| head -c {_MAX_OUTPUT_CHUNK_BYTES} | base64 | tr -d '\\n'",
                 60,
             )
-            text = result.stdout if result.exit_status == 0 else ""
-            next_offset = safe_offset + len(text.encode("utf-8"))
+            raw = b""
+            if result.exit_status == 0 and result.stdout.strip():
+                with contextlib.suppress(Exception):
+                    raw = base64.b64decode(result.stdout.strip(), validate=True)
+            next_offset = safe_offset + len(raw)
             next_offsets.append(next_offset)
-            if text:
-                chunks.append(OutputChunk(stream=stream, text=text, offset=next_offset))
+            if raw:
+                chunks.append(
+                    OutputChunk(
+                        stream=stream,
+                        text=raw.decode("utf-8", errors="replace"),
+                        offset=next_offset,
+                    )
+                )
         return chunks, next_offsets[0], next_offsets[1]
 
     async def diagnose(self, handle: ManagedCommandHandle) -> dict[str, str]:

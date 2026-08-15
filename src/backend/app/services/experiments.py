@@ -36,7 +36,7 @@ from app.schemas.experiment import (
     ExperimentRunRead,
 )
 from app.services import ssh_exec
-from app.services.managed_commands import OperationContext, RepairScope
+from app.services.managed_commands import OperationContext, RepairScope, redact_text
 from app.services.managed_ssh import ManagedCommandHandle
 from app.services.projects import in_my_projects
 
@@ -89,13 +89,20 @@ def append_terminal_output(
     stream: str,
     text: str,
 ) -> Path:
+    """远端命令原始输出落盘。
+
+    写之前先脱敏：这个文件通过 /experiments/{id}/terminal-logs 原样发给课题成员
+    与平台管理员，是这套机制里最大的一个外露面。快照和失败报告都脱敏了，这里不脱
+    就等于白做——实验脚本里 echo 一次 HF_TOKEN 就直接进了所有人的终端面板。
+    """
     path = terminal_log_path(experiment_id)
     path.parent.mkdir(parents=True, exist_ok=True)
+    safe_text = redact_text(text)
     prefix = f"[{operation}][{stream}] "
     with path.open("a", encoding="utf-8") as file:
-        for line in text.splitlines(keepends=True):
+        for line in safe_text.splitlines(keepends=True):
             file.write(prefix + line)
-        if text and not text.endswith(("\n", "\r")):
+        if safe_text and not safe_text.endswith(("\n", "\r")):
             file.write("\n")
     return path
 
