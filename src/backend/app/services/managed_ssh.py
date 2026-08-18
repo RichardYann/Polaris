@@ -53,6 +53,27 @@ class OutputChunk:
     offset: int
 
 
+@dataclass(slots=True, frozen=True)
+class ManagedGPUUsage:
+    """GPU processes which can be attributed to one managed process group."""
+
+    status: str
+    process_alive: bool
+    process_ids: tuple[int, ...] = ()
+    used_memory_mib: int = 0
+
+
+@dataclass(slots=True, frozen=True)
+class ManagedStopResult:
+    """Verified result of an attempt-scoped remote stop request."""
+
+    status: str
+    confirmed: bool
+
+    def __bool__(self) -> bool:
+        return self.confirmed
+
+
 class ManagedCommandLaunchError(RuntimeError):
     """A managed operation failed before a durable handle could be recovered."""
 
@@ -207,6 +228,7 @@ class SSHManagedCommands:
                 f"prefix={prefix}\n"
                 "echo $$ > ${prefix}.pid\n"
                 "ps -o pgid= -p $$ | tr -d ' ' > ${prefix}.pgid\n"
+                "awk '{print $22}' /proc/$$/stat > ${prefix}.start_ticks 2>/dev/null || true\n"
                 "date +%s > ${prefix}.started\n"
                 "touch ${prefix}.stdout ${prefix}.stderr\n"
                 # 命令单独成行：写成 `{ cmd; }` 时，只要 cmd 以注释收尾
@@ -441,20 +463,131 @@ class SSHManagedCommands:
             evidence[name] = redact_text(result.stdout or result.stderr or "unavailable", tail=True)
         return evidence
 
-    async def stop(self, handle: ManagedCommandHandle) -> bool:
+    async def gpu_usage(self, handle: ManagedCommandHandle) -> ManagedGPUUsage:
+        """Return GPU use attributable to this attempt, never machine-wide use.
+
+        The process group is the durable identity of a managed command.  We
+        deliberately do not treat an unrelated PID from ``nvidia-smi`` as this
+        command merely because it runs on the same host.
+        """
         current = await self.current_attempt_id(handle.operation_id)
         if current != handle.attempt_id:
-            return False
+            return ManagedGPUUsage(status="superseded", process_alive=False)
         snapshot = await self.snapshot(handle)
         if not snapshot.process_alive:
-            return True
+            return ManagedGPUUsage(status="exited", process_alive=False)
+
         pgid = int(snapshot.process_group_id or handle.process_group_id)
-        await self._run(
-            f"kill -TERM -- -{pgid} 2>/dev/null || true; "
-            f"i=0; while kill -0 {snapshot.process_id} 2>/dev/null && [ $i -lt 20 ]; "
-            "do sleep 0.25; i=$((i+1)); done; "
-            f"kill -KILL -- -{pgid} 2>/dev/null || true",
+        processes = await self._run("ps -eo pid=,ppid=,pgid= 2>/dev/null", 60)
+        if processes.exit_status != 0:
+            return ManagedGPUUsage(status="process_probe_unavailable", process_alive=True)
+
+        rows: dict[int, tuple[int, int]] = {}
+        for line in processes.stdout.splitlines():
+            try:
+                pid, ppid, row_pgid = (int(value) for value in line.split()[:3])
+            except (ValueError, IndexError):
+                continue
+            rows[pid] = (ppid, row_pgid)
+        related = {pid for pid, (_, row_pgid) in rows.items() if row_pgid == pgid}
+        # Include descendants as a defensive fallback for shells which create a
+        # separate process group.  This remains command-scoped and does not use
+        # executable-name adapters.
+        changed = True
+        while changed:
+            changed = False
+            for pid, (ppid, _) in rows.items():
+                if ppid in related and pid not in related:
+                    related.add(pid)
+                    changed = True
+
+        gpu = await self._run(
+            "nvidia-smi --query-compute-apps=pid,used_memory "
+            "--format=csv,noheader,nounits 2>/dev/null",
             60,
         )
-        verified = await self._run(f"kill -0 {snapshot.process_id} 2>/dev/null", 60)
-        return verified.exit_status != 0
+        if gpu.exit_status != 0:
+            return ManagedGPUUsage(status="gpu_probe_unavailable", process_alive=True)
+        matches: list[int] = []
+        used_memory = 0
+        for line in gpu.stdout.splitlines():
+            fields = [field.strip() for field in line.split(",", 1)]
+            try:
+                pid = int(fields[0])
+                memory = int(fields[1])
+            except (ValueError, IndexError):
+                continue
+            if pid in related:
+                matches.append(pid)
+                used_memory += max(0, memory)
+        return ManagedGPUUsage(
+            status="active" if matches else "idle",
+            process_alive=True,
+            process_ids=tuple(sorted(matches)),
+            used_memory_mib=used_memory,
+        )
+
+    async def stop(self, handle: ManagedCommandHandle) -> ManagedStopResult:
+        """Stop only the still-current process identity represented by ``handle``.
+
+        The former implementation checked ``current`` and process metadata in
+        separate SSH commands before signalling.  A new attempt (or PID reuse)
+        could slip into those gaps.  This script shares the launch lock and
+        validates attempt, PID/PGID, and (when available) Linux start ticks in
+        the same remote critical section which sends the signal.
+        """
+        operation_dir = self._operation_dir(handle.operation_id)
+        prefix = self._attempt_prefix(handle.operation_id, handle.attempt_id)
+        expected_pid = int(handle.process_id)
+        expected_pgid = int(handle.process_group_id)
+        if expected_pid <= 0 or expected_pgid <= 0:
+            return ManagedStopResult(status="invalid_identity", confirmed=False)
+        script = (
+            "#!/usr/bin/env bash\n"
+            "# polaris-managed-stop\n"
+            "set +e\n"
+            f"operation_dir={operation_dir}\n"
+            f"prefix={prefix}\n"
+            f"expected_attempt={handle.attempt_id}\n"
+            f"expected_pid={expected_pid}\n"
+            f"expected_pgid={expected_pgid}\n"
+            "lock=${operation_dir}/launch.lock\n"
+            "i=0\n"
+            "until mkdir \"$lock\" 2>/dev/null; do\n"
+            "  i=$((i+1)); [ $i -lt 40 ] || { printf 'lock_busy\\n'; exit 75; }\n"
+            "  sleep 0.25\n"
+            "done\n"
+            "trap 'rmdir \"$lock\" 2>/dev/null || true' EXIT\n"
+            "current=$(cat \"${operation_dir}/current\" 2>/dev/null)\n"
+            "[ \"$current\" = \"$expected_attempt\" ] || "
+            "{ printf 'attempt_changed\\n'; exit 76; }\n"
+            "pid=$(cat \"${prefix}.pid\" 2>/dev/null)\n"
+            "pgid=$(cat \"${prefix}.pgid\" 2>/dev/null)\n"
+            "case $pid:$pgid in *[!0-9:]*|:*) printf 'invalid_identity\\n'; exit 76;; esac\n"
+            "[ \"$pid\" = \"$expected_pid\" ] && [ \"$pgid\" = \"$expected_pgid\" ] || "
+            "{ printf 'identity_changed\\n'; exit 76; }\n"
+            "if ! kill -0 \"$pid\" 2>/dev/null; then printf 'already_exited\\n'; exit 0; fi\n"
+            "saved_ticks=$(cat \"${prefix}.start_ticks\" 2>/dev/null)\n"
+            "if [ -n \"$saved_ticks\" ]; then\n"
+            "  current_ticks=$(awk '{print $22}' \"/proc/$pid/stat\" 2>/dev/null)\n"
+            "  [ \"$current_ticks\" = \"$saved_ticks\" ] || "
+            "{ printf 'process_reused\\n'; exit 76; }\n"
+            "fi\n"
+            "kill -TERM -- -\"$pgid\" 2>/dev/null || true\n"
+            "i=0\n"
+            "while kill -0 \"$pid\" 2>/dev/null && [ $i -lt 20 ]; do "
+            "sleep 0.25; i=$((i+1)); done\n"
+            "if kill -0 \"$pid\" 2>/dev/null; then\n"
+            "  kill -KILL -- -\"$pgid\" 2>/dev/null || true\n"
+            "  sleep 0.25\n"
+            "fi\n"
+            "if kill -0 \"$pid\" 2>/dev/null; then printf 'stop_unconfirmed\\n'; exit 1; fi\n"
+            "printf 'stopped\\n'\n"
+        )
+        result = await self._run(script, 70)
+        status = (result.stdout or "").strip().splitlines()
+        outcome = status[-1] if status else "stop_unconfirmed"
+        return ManagedStopResult(
+            status=outcome,
+            confirmed=result.exit_status == 0 and outcome in {"stopped", "already_exited"},
+        )

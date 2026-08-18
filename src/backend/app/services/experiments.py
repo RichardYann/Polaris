@@ -37,7 +37,7 @@ from app.schemas.experiment import (
 )
 from app.services import ssh_exec
 from app.services.managed_commands import OperationContext, RepairScope, redact_text
-from app.services.managed_ssh import ManagedCommandHandle
+from app.services.managed_ssh import ManagedCommandHandle, ManagedGPUUsage, ManagedStopResult
 from app.services.projects import in_my_projects
 
 logger = logging.getLogger("polaris.experiments")
@@ -70,10 +70,15 @@ def local_log_path(experiment_id: uuid.UUID | str, seq: int) -> Path:
 
 
 def append_local_log(experiment_id: uuid.UUID | str, seq: int, text: str) -> Path:
+    """Append a redacted copy of run output to the user-visible log mirror.
+
+    Metric parsing happens before this function is called, so keeping secrets
+    off disk does not alter the experiment's structured results.
+    """
     path = local_log_path(experiment_id, seq)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8") as f:
-        f.write(text)
+        f.write(redact_text(text))
     return path
 
 
@@ -435,17 +440,35 @@ async def stop_managed_command_by_voyage(
     session: AsyncSession,
     voyage_id: uuid.UUID,
     handle_data: dict[str, Any],
-) -> bool:
+) -> ManagedStopResult:
     """Stop exactly the attempt shown in a managed-command ask and verify it died."""
     experiment = (
         await session.execute(select(Experiment).where(Experiment.voyage_id == voyage_id))
     ).scalar_one_or_none()
     if experiment is None or experiment.credential_id is None:
-        return False
+        return ManagedStopResult(status="experiment_unavailable", confirmed=False)
     credential = await session.get(SSHCredential, experiment.credential_id)
+    handle = managed_handle_from_data(handle_data)
+    if credential is None or handle is None:
+        return ManagedStopResult(status="invalid_handle", confirmed=False)
+    executor = await ssh_exec.open_executor(
+        credential=credential,
+        exp_id=str(experiment.id),
+        project_id=experiment.project_id,
+    )
+    try:
+        return await executor.stop_managed_command(handle)
+    finally:
+        await executor.close()
+
+
+def managed_handle_from_data(handle_data: Any) -> ManagedCommandHandle | None:
+    """Restore a validated handle saved in a managed-command ask payload."""
+    if not isinstance(handle_data, dict):
+        return None
     context_data = handle_data.get("context")
-    if credential is None or not isinstance(context_data, dict):
-        return False
+    if not isinstance(context_data, dict):
+        return None
     try:
         context = OperationContext(
             phase=str(context_data["phase"]),
@@ -457,22 +480,43 @@ async def stop_managed_command_by_voyage(
             hard_timeout_seconds=context_data.get("hard_timeout_seconds"),
             repair_scope=RepairScope(str(context_data.get("repair_scope") or "none")),
         )
-        handle = ManagedCommandHandle(
+        process_id = int(handle_data["process_id"])
+        process_group_id = int(handle_data["process_group_id"])
+        if process_id <= 0 or process_group_id <= 0:
+            return None
+        return ManagedCommandHandle(
             operation_id=str(handle_data["operation_id"]),
-            attempt_id=str(handle_data["attempt_id"]),
+            attempt_id=str(uuid.UUID(str(handle_data["attempt_id"]))),
             context=context,
-            process_id=int(handle_data["process_id"]),
-            process_group_id=int(handle_data["process_group_id"]),
+            process_id=process_id,
+            process_group_id=process_group_id,
         )
     except (KeyError, TypeError, ValueError):
-        return False
+        return None
+
+
+async def managed_command_gpu_usage_by_voyage(
+    session: AsyncSession,
+    voyage_id: uuid.UUID,
+    handle_data: dict[str, Any],
+) -> ManagedGPUUsage:
+    """Inspect GPU use for exactly the attempt referenced by an open ask."""
+    experiment = (
+        await session.execute(select(Experiment).where(Experiment.voyage_id == voyage_id))
+    ).scalar_one_or_none()
+    handle = managed_handle_from_data(handle_data)
+    if experiment is None or experiment.credential_id is None or handle is None:
+        return ManagedGPUUsage(status="invalid_handle", process_alive=False)
+    credential = await session.get(SSHCredential, experiment.credential_id)
+    if credential is None:
+        return ManagedGPUUsage(status="credential_unavailable", process_alive=False)
     executor = await ssh_exec.open_executor(
         credential=credential,
         exp_id=str(experiment.id),
         project_id=experiment.project_id,
     )
     try:
-        return await executor.stop_managed_command(handle)
+        return await executor.managed_command_gpu_usage(handle)
     finally:
         await executor.close()
 

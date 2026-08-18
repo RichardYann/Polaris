@@ -23,7 +23,7 @@ from app.core.llm.router import LLMRouter
 from app.models.activity import Activity
 from app.models.experiment import Experiment, ExperimentRun
 from app.models.idea import Idea
-from app.models.voyage import VoyageRun
+from app.models.voyage import VoyageMessage, VoyageRun
 from app.services import ssh_exec
 from tests.conftest import RecordingBus, register_and_login
 from tests.fake_ssh import FakeSSHConnector, FakeSSHServer, FakeSSHSession
@@ -1053,6 +1053,16 @@ async def test_budget_timeout_keeps_run_and_asks(client, queue_stub, fake_ssh, b
     run_step = next(s for s in resp.json()["steps"] if s["action"] == "experiment.run")
     assert run_step["observation"]["remote_operation_continues"] is True
 
+    observed_stop_status: list[str] = []
+
+    async def observe_claim_before_signal(command: str) -> None:
+        if "# polaris-managed-stop" not in command:
+            return
+        async with get_sessionmaker()() as session:
+            ask = await session.get(VoyageMessage, uuid.UUID(ask_id))
+            observed_stop_status.append(ask.status)
+
+    fake_ssh.on_command = observe_claim_before_signal
     resp = await client.post(
         f"/api/voyages/{voyage_id}/asks/{ask_id}/answer",
         headers=headers,
@@ -1060,6 +1070,8 @@ async def test_budget_timeout_keeps_run_and_asks(client, queue_stub, fake_ssh, b
     )
     assert resp.status_code == 201, resp.text
     assert fake_ssh.pid in fake_ssh.killed
+    assert observed_stop_status == ["stopping"]
+    assert resp.json()["payload"]["stop_status"] == "stopped"
 
 
 async def test_cancel_during_run_polling(client, queue_stub, fake_ssh, bus_recorder):

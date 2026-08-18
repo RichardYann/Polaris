@@ -4,6 +4,7 @@ from app.services.managed_commands import (
     failure_from_exception,
 )
 from app.services.managed_ssh import ManagedCommandLaunchError, SSHManagedCommands
+from app.services.ssh_exec import SSHResult
 from tests.fake_ssh import FakeSSHServer, FakeSSHSession
 
 
@@ -63,11 +64,56 @@ async def test_stop_only_targets_current_attempt_and_verifies_exit():
     manager = _manager(server)
     handle = await manager.start(_context(), "bash run.sh")
 
-    assert await manager.stop(handle) is True
+    outcome = await manager.stop(handle)
+    assert outcome.confirmed is True
+    assert outcome.status == "stopped"
     assert handle.process_group_id in server.killed
     snapshot = await manager.snapshot(handle)
     assert snapshot.process_alive is False
     assert snapshot.exit_status == -15
+
+
+async def test_stop_refuses_an_attempt_replaced_before_the_signal():
+    """The current-attempt check must live in the same remote critical section as kill."""
+    server = FakeSSHServer(run_exit=None)
+    manager = _manager(server)
+    handle = await manager.start(_context(), "bash run.sh")
+    operation_dir = manager._operation_dir(handle.operation_id)
+    server.managed_files[f"{operation_dir}/current"] = (
+        "22222222-2222-2222-2222-222222222222"
+    )
+
+    outcome = await manager.stop(handle)
+    assert outcome.confirmed is False
+    assert outcome.status == "attempt_changed"
+    assert server.killed == []
+    stop_commands = [c for c in server.commands if "# polaris-managed-stop" in c]
+    assert len(stop_commands) == 1
+
+
+async def test_stop_refuses_changed_process_identity():
+    server = FakeSSHServer(run_exit=None)
+    manager = _manager(server)
+    handle = await manager.start(_context(), "bash run.sh")
+    prefix = server.managed_prefix_by_pid[handle.process_id]
+    server.managed_files[f"{prefix}.pid"] = str(handle.process_id + 1)
+
+    outcome = await manager.stop(handle)
+    assert outcome.confirmed is False
+    assert outcome.status == "identity_changed"
+    assert server.killed == []
+
+
+async def test_stop_reports_when_the_attempt_already_exited():
+    server = FakeSSHServer(run_exit=0)
+    manager = _manager(server)
+    handle = await manager.start(_context(), "bash run.sh")
+
+    outcome = await manager.stop(handle)
+
+    assert outcome.confirmed is True
+    assert outcome.status == "already_exited"
+    assert server.killed == []
 
 
 async def test_launch_timeout_recovers_the_durable_attempt():
@@ -208,3 +254,66 @@ def test_terminal_log_is_redacted_before_it_reaches_disk(tmp_path, monkeypatch):
     assert "hf_cccccccccccccccccccccccccccccc" not in content
     assert "[REDACTED]" in content
     assert "epoch 1 ok" in content  # 正常输出不受影响
+
+
+def test_run_log_is_redacted_before_it_reaches_disk(tmp_path, monkeypatch):
+    from app.core.config import get_settings
+    from app.services import experiments as experiments_service
+
+    monkeypatch.setattr(get_settings(), "data_dir", str(tmp_path))
+    path = experiments_service.append_local_log(
+        "11111111-1111-1111-1111-111111111111",
+        1,
+        "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwxyz\nloss=0.2\n",
+    )
+    content = path.read_text()
+    assert "sk-abcdefghijklmnopqrstuvwxyz" not in content
+    assert "[REDACTED]" in content
+    assert "loss=0.2" in content
+
+
+async def test_gpu_usage_is_attributed_to_the_managed_process_group_only():
+    server = FakeSSHServer(run_exit=None)
+    manager = _manager(server)
+    handle = await manager.start(_context(), "bash run.sh")
+    original_run = manager._run
+
+    async def run(command: str, timeout: float | None = None):
+        if command.startswith("ps -eo pid="):
+            return SSHResult(
+                0,
+                f"{handle.process_id} 1 {handle.process_group_id}\n"
+                f"8001 {handle.process_id} 9000\n"
+                "9001 1 9001\n",
+                "",
+            )
+        if command.startswith("nvidia-smi --query-compute-apps"):
+            return SSHResult(0, "8001, 4096\n9001, 8192\n", "")
+        return await original_run(command, timeout)
+
+    manager._run = run
+    usage = await manager.gpu_usage(handle)
+
+    assert usage.status == "active"
+    assert usage.process_ids == (8001,)
+    assert usage.used_memory_mib == 4096
+
+
+async def test_gpu_usage_does_not_claim_an_unrelated_machine_process():
+    server = FakeSSHServer(run_exit=None)
+    manager = _manager(server)
+    handle = await manager.start(_context(), "bash run.sh")
+    original_run = manager._run
+
+    async def run(command: str, timeout: float | None = None):
+        if command.startswith("ps -eo pid="):
+            return SSHResult(0, f"{handle.process_id} 1 {handle.process_group_id}\n", "")
+        if command.startswith("nvidia-smi --query-compute-apps"):
+            return SSHResult(0, "9001, 8192\n", "")
+        return await original_run(command, timeout)
+
+    manager._run = run
+    usage = await manager.gpu_usage(handle)
+
+    assert usage.status == "idle"
+    assert usage.used_memory_mib == 0
