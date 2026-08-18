@@ -118,6 +118,7 @@ class FakeSSHSession:
             server.managed_prefix_by_pid[pid] = prefix
             server.managed_files[f"{prefix}.pid"] = str(pid)
             server.managed_files[f"{prefix}.pgid"] = str(pid)
+            server.managed_files[f"{prefix}.start_ticks"] = str(pid * 100)
             started = int(time.time()) - (1000 if exit_status is None else 1)
             server.managed_files[f"{prefix}.started"] = str(started)
             server.managed_files[f"{prefix}.stdout"] = stdout
@@ -155,6 +156,30 @@ class FakeSSHSession:
             if "base64" in command:
                 return SSHResult(0, base64.b64encode(raw).decode(), "")
             return SSHResult(0, raw.decode(errors="replace"), "")
+        if "# polaris-managed-stop" in command:
+            def assignment(name: str) -> str | None:
+                match = re.search(rf"^{name}=([^\n]+)$", command, re.MULTILINE)
+                return match.group(1) if match else None
+
+            operation_dir = assignment("operation_dir")
+            prefix = assignment("prefix")
+            attempt = assignment("expected_attempt")
+            expected_pid = assignment("expected_pid")
+            expected_pgid = assignment("expected_pgid")
+            if not all((operation_dir, prefix, attempt, expected_pid, expected_pgid)):
+                return SSHResult(76, "invalid_identity\n", "")
+            current = server.managed_files.get(f"{operation_dir}/current")
+            if current != attempt:
+                return SSHResult(76, "attempt_changed\n", "")
+            pid = server.managed_files.get(f"{prefix}.pid")
+            pgid = server.managed_files.get(f"{prefix}.pgid")
+            if pid != expected_pid or pgid != expected_pgid:
+                return SSHResult(76, "identity_changed\n", "")
+            if f"{prefix}.exit" in server.managed_files:
+                return SSHResult(0, "already_exited\n", "")
+            server.managed_files[f"{prefix}.exit"] = "-15"
+            server.killed.append(int(expected_pgid))
+            return SSHResult(0, "stopped\n", "")
         if command.startswith("ps -o etimes="):
             return SSHResult(0, "1 00:00:01 S wait\n", "")
         if "kill -TERM -- -" in command:

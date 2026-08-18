@@ -25,6 +25,8 @@ from app.models.ssh_credential import SSHCredential
 from app.services.managed_commands import CommandSnapshot, OperationContext, RepairScope
 from app.services.managed_ssh import (
     ManagedCommandHandle,
+    ManagedGPUUsage,
+    ManagedStopResult,
     OutputChunk,
     SSHManagedCommands,
 )
@@ -533,7 +535,12 @@ class SSHExecutor:
     ) -> dict[str, str]:
         return await self._managed_commands().diagnose(handle)
 
-    async def stop_managed_command(self, handle: ManagedCommandHandle) -> bool:
+    async def managed_command_gpu_usage(
+        self, handle: ManagedCommandHandle
+    ) -> ManagedGPUUsage:
+        return await self._managed_commands().gpu_usage(handle)
+
+    async def stop_managed_command(self, handle: ManagedCommandHandle) -> ManagedStopResult:
         return await self._managed_commands().stop(handle)
 
     # ---- 白名单命令模板（唯一的远程命令来源） ----

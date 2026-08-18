@@ -18,7 +18,12 @@ from typing import Any, Protocol, runtime_checkable
 
 from app.models.ssh_credential import SSHCredential
 from app.services.managed_commands import CommandSnapshot, OperationContext, RepairScope
-from app.services.managed_ssh import ManagedCommandHandle, OutputChunk
+from app.services.managed_ssh import (
+    ManagedCommandHandle,
+    ManagedGPUUsage,
+    ManagedStopResult,
+    OutputChunk,
+)
 from app.services.ssh_exec import (
     ENV_SOURCE_PREFIX,
     PLOT_TIMEOUT_SECONDS,
@@ -95,7 +100,10 @@ class Runner(Protocol):
     async def diagnose_managed_command(
         self, handle: ManagedCommandHandle
     ) -> dict[str, str]: ...
-    async def stop_managed_command(self, handle: ManagedCommandHandle) -> bool: ...
+    async def managed_command_gpu_usage(
+        self, handle: ManagedCommandHandle
+    ) -> ManagedGPUUsage: ...
+    async def stop_managed_command(self, handle: ManagedCommandHandle) -> ManagedStopResult: ...
     async def check_pid(self, pid: int) -> bool: ...
     async def read_exit_code(self) -> int | None: ...
     async def tail_log(self, offset: int = 0) -> tuple[str, int]: ...
