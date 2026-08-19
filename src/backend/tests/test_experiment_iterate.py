@@ -652,12 +652,6 @@ def test_primary_value_and_improvement_unit():
     assert ax.parse_metrics_json('["list"]') == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="managed 轮询路径重连后不写 experiment.ssh_reconnect 审计："
-    "该审计只在 actions_experiment 的旧轮询循环里写（捕获连接错误那一支），"
-    "managed 快照走的是另一条路，断连-重连对运维不再留痕。",
-)
 async def test_poll_survives_ssh_reconnect(client, queue_stub, fake_ssh, bus_recorder, monkeypatch):
     """轮询期间 SSH 瞬时断开 → 重连后继续跟踪，实验不因单次断连而失败。
 
@@ -805,25 +799,16 @@ async def test_stuck_escalates_to_approach_change(client, queue_stub, fake_ssh, 
     assert "已连续" in provider.improve_prompts[1]
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="冒烟超时不再自愈：managed 化后走确定性中断策略，"
-    "默认升级为 ask_user_while_running（航程停在 paused_ask）而不是自动改小重试。"
-    "这是产品行为变更，需要作者确认是否有意——无人值守场景下不再自动收敛。",
-)
-async def test_smoke_timeout_is_recoverable(client, queue_stub, fake_ssh, bus_recorder):
-    """冒烟超时不再硬崩：诊断为『太慢/超时』→ 自动改小重试 → 通过，航程继续。
+async def test_slow_smoke_asks_without_interrupting_remote_command(
+    client, queue_stub, fake_ssh, bus_recorder
+):
+    """低置信度的 smoke 超时保留远程进程，并把决定交给用户。
 
-    回归自适应循环的一类失败：训练类实验冒烟常因规模太大而超时(TimeoutError),
-    以前直接判失败;现在当作可修失败,重连+让 LLM 把冒烟改小再试。"""
-    state = {"raised": 0}
-
-    async def timeout_once(command: str) -> None:
-        if "--smoke" in command and state["raised"] == 0:
-            state["raised"] += 1
-            raise TimeoutError("smoke timed out")
-
-    fake_ssh.on_command = timeout_once
+    这与 launch SSH 调用自身抛 TimeoutError 不同：这里命令已有 durable handle、仍在运行，
+    只是超过 soft/stall 阈值且没有足够证据证明卡死。平台不得擅自停止或重写生成文件。
+    """
+    fake_ssh.smoke_exits = [None]
+    fake_ssh.managed_output_age_seconds = 1000
     project_id, headers, exp_id, voyage_id = await _launch_experiment(
         client, budget={"max_hours": 2, "max_runs": 1}
     )
@@ -831,23 +816,21 @@ async def test_smoke_timeout_is_recoverable(client, queue_stub, fake_ssh, bus_re
         client, headers, project_id, voyage_id, _router_with(_FixedReflectionProvider("improve"))
     )
 
-    assert state["raised"] == 1  # 确实注入了一次冒烟超时
     voyage_status, _ = await _iterate_observation(client, headers, voyage_id)
-    assert voyage_status == "done"  # 没在 smoke 硬崩,跑到 analyze 并收尾
+    assert voyage_status == "paused_ask"
 
     resp = await client.get(f"/api/voyages/{voyage_id}", headers=headers)
-    smoke = next(s for s in resp.json()["steps"] if s["action"] == "experiment.smoke")
-    assert smoke["status"] == "passed"
-    assert (smoke["observation"] or {}).get("fixes", 0) >= 1  # 记录了一次方案级修复
-    assert len(fake_ssh.connects) >= 2  # 超时后重连过
+    payload = resp.json()
+    assert payload["open_ask"]["payload"]["ask_kind"] == "managed_command"
+    assert payload["open_ask"]["payload"]["context"]["remote_operation_continues"] is True
+    smoke = next(s for s in payload["steps"] if s["action"] == "experiment.smoke")
+    assert smoke["status"] == "pending"
+    assert _managed_launches(fake_ssh, "application-smoke") == 1
+    assert _managed_launches(fake_ssh, "experiment-run") == 0
+    detail = await _get_detail(client, headers, exp_id)
+    assert detail["status"] == "waiting_user"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="worker 重启后的重挂路径挂死：phase2 的 engine.resume 永不返回。"
-    "此前这条测试因为按旧命令模板计数、在更早的断言就失败，把挂死掩盖了。"
-    "它守的是线上 bug「每次部署重启孤儿一轮」，必须修。",
-)
 async def test_run_reattaches_after_worker_restart(client, queue_stub, fake_ssh, bus_recorder):
     """worker 重启（resume 被打断后重跑）→ run 步骤**重挂**上一轮仍在跑的远端进程，
     不再起第二轮（回归：新旧进程树共写 run.log/run.exit，每次部署重启孤儿一轮）。"""
@@ -877,8 +860,10 @@ async def test_run_reattaches_after_worker_restart(client, queue_stub, fake_ssh,
 
     # 阶段二：远端进程已结束（run.exit=0 落盘），新 worker 重跑 resume → 应重挂而非再 launch
     fake_ssh.run_exit = 0
+    managed_prefix = fake_ssh.managed_prefix_by_pid[fake_ssh.pid]
+    fake_ssh.managed_files[f"{managed_prefix}.exit"] = "0"
     engine2, _ = _make_engine(_router_with(_FixedReflectionProvider("improve")))
-    # 加时限：重挂路径当前会永久挂起，不设界限整个测试会话都会被卡住
+    # 界限防止未来回归再次卡住整个测试会话。
     await asyncio.wait_for(engine2.resume(uuid.UUID(voyage_id)), 10)
 
     assert _managed_launches(fake_ssh, "experiment-run") == 1  # 没有第二次 launch

@@ -83,6 +83,9 @@ class Runner(Protocol):
     # —— 跑实验入口（后台脱离 + 轮询观测）——
     async def launch_run(self) -> tuple[int, str]: ...
     async def launch_managed_run(self) -> ManagedCommandHandle: ...
+    async def recover_managed_command(
+        self, context: OperationContext
+    ) -> ManagedCommandHandle | None: ...
     async def inspect_managed_command(
         self,
         handle: ManagedCommandHandle,

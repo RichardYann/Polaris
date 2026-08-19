@@ -504,6 +504,11 @@ class SSHExecutor:
             attempt_id=attempt_id,
         )
 
+    async def recover_managed_command(
+        self, context: OperationContext
+    ) -> ManagedCommandHandle | None:
+        return await self._managed_commands().recover_current(context)
+
     async def inspect_managed_command(
         self,
         handle: ManagedCommandHandle,

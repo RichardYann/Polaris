@@ -317,6 +317,35 @@ class SSHManagedCommands:
         except (ValueError, IndexError):
             return None
 
+    async def recover_current(
+        self, context: OperationContext
+    ) -> ManagedCommandHandle | None:
+        """Recover the durable handle most recently selected for an operation.
+
+        Unlike :meth:`start`, recovery also returns an attempt which has already
+        written its exit status.  A worker can therefore finish bookkeeping for
+        the exact remote command it launched before the restart, instead of
+        starting a duplicate or falling back to legacy ``run.log/run.exit`` files.
+        """
+        operation_id = self._validate_operation_id(context.operation)
+        # Re-read the pointer after recovering the pid/pgid.  A concurrent launch
+        # may rotate ``current`` while these files are being inspected; observing
+        # it is safe, but returning it as the current logical operation is not.
+        for _ in range(2):
+            attempt_id = await self.current_attempt_id(operation_id)
+            if attempt_id is None:
+                return None
+            handle = await self._recover_started_handle(
+                operation_id=operation_id,
+                attempt_id=attempt_id,
+                context=context,
+            )
+            if handle is None:
+                return None
+            if await self.current_attempt_id(operation_id) == attempt_id:
+                return handle
+        return None
+
     async def _read_int(self, path: str) -> int | None:
         result = await self._run(f"cat {path} 2>/dev/null", 60)
         if result.exit_status != 0:

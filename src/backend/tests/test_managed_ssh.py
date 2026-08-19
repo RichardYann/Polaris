@@ -59,6 +59,21 @@ async def test_completed_attempt_allows_a_new_attempt():
     assert sum("nohup setsid bash" in command for command in server.commands) == 2
 
 
+async def test_recover_current_returns_completed_attempt_without_relaunching():
+    server = FakeSSHServer(run_exit=0)
+    manager = _manager(server)
+
+    launched = await manager.start(_context(), "bash run.sh")
+    recovered = await manager.recover_current(_context())
+
+    assert recovered is not None
+    assert recovered.attempt_id == launched.attempt_id
+    assert recovered.process_id == launched.process_id
+    snapshot = await manager.snapshot(recovered)
+    assert snapshot.exit_status == 0
+    assert sum("nohup setsid bash" in command for command in server.commands) == 1
+
+
 async def test_stop_only_targets_current_attempt_and_verifies_exit():
     server = FakeSSHServer(run_exit=None)
     manager = _manager(server)

@@ -25,6 +25,7 @@ class FakeSSHServer:
     managed_files: dict[str, str] = field(default_factory=dict)
     managed_pid: int = 7373
     managed_prefix_by_pid: dict[int, str] = field(default_factory=dict)
+    managed_output_age_seconds: int = 0
 
     connect_error: str | None = None  # 置为字符串则 connect 抛 ConnectionError
     venv_exit: int = 0
@@ -42,7 +43,9 @@ class FakeSSHServer:
     # 资源预检用：本机文件内容（cat <path> → 内容，如模型 config.json）；未登记 = 缺失
     host_files: dict[str, str] = field(default_factory=dict)
     host_paths: set[str] = field(default_factory=set)  # test -e <path> 存在的路径（数据集目录等）
-    smoke_exits: list[int] = field(default_factory=list)  # 逐次弹出；耗尽后恒 0
+    smoke_exits: list[int | None] = field(
+        default_factory=list
+    )  # 逐次弹出；None = managed smoke 仍在运行，耗尽后恒 0
     smoke_stderr: str = "Traceback (most recent call last): boom"
     run_log: str = ""
     run_exit: int | None = 0  # None = 进程一直不结束（cat run.exit 读不到）
@@ -139,8 +142,10 @@ class FakeSSHSession:
             return SSHResult(0, f"{value}\n", "") if value is not None else SSHResult(1, "", "")
         if command.startswith("stat -c") and ".polaris/operations/" in command:
             paths = command.split(" 2>/dev/null", 1)[0].split()[-2:]
-            now = int(time.time())
-            rows = [f"{len(server.managed_files.get(path, '').encode())} {now}" for path in paths]
+            mtime = int(time.time()) - server.managed_output_age_seconds
+            rows = [
+                f"{len(server.managed_files.get(path, '').encode())} {mtime}" for path in paths
+            ]
             return SSHResult(0, "\n".join(rows) + "\n", "")
         if command.startswith("tail -c") and ".polaris/operations/" in command:
             path = command.split(" 2>/dev/null", 1)[0].split()[-1]

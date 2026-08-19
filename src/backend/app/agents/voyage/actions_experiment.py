@@ -1021,6 +1021,7 @@ async def _monitor_managed_command(
     diagnostics_run = 0
     diagnostic_evidence: dict[str, str] | None = None
     next_assessment_at = 0.0
+    reconnect_streak = 0
 
     def append_lifecycle(message: str) -> None:
         experiments_service.append_terminal_output(
@@ -1071,9 +1072,35 @@ async def _monitor_managed_command(
         except Exception as exc:  # noqa: BLE001 - reconnect never restarts command
             if not ssh_exec.is_connection_error(exc):
                 raise
+            reconnect_streak += 1
+            session.add(
+                Activity(
+                    project_id=ctx.run.project_id,
+                    actor="system:voyage",
+                    kind="experiment.ssh_reconnect",
+                    message=(
+                        "Managed command polling lost SSH; reconnecting "
+                        f"(attempt {reconnect_streak}): {type(exc).__name__}"
+                    ),
+                    payload={
+                        "experiment_id": str(experiment.id),
+                        "operation_id": handle.operation_id,
+                        "attempt_id": handle.attempt_id,
+                        "run_seq": run.seq if run is not None else None,
+                        "attempt": reconnect_streak,
+                    },
+                )
+            )
+            await session.commit()
+            append_lifecycle(
+                f"SSH connection lost; reconnecting to the same managed attempt "
+                f"({reconnect_streak}): {type(exc).__name__}"
+            )
             await reconnect()
-            await asyncio.sleep(MANAGED_COMMAND_POLL_SECONDS)
+            await asyncio.sleep(_reconnect_backoff(reconnect_streak))
             continue
+
+        reconnect_streak = 0
 
         if await _voyage_cancelled(session, ctx):
             append_lifecycle("voyage cancelled; stopping the current remote command")
@@ -2599,6 +2626,25 @@ async def experiment_run(ctx: ActionContext, params: dict[str, Any]) -> dict[str
                 # 重挂从日志头重放：清掉该轮已存的 metrics 避免重复合并（本地日志允许少量重复行）
                 run.metrics = None
                 await session.commit()
+                if managed_handle is None:
+                    recovered = await executor.recover_managed_command(
+                        OperationContext(
+                            phase="application.run",
+                            operation="experiment-run",
+                            display_command=run.command,
+                            target=experiment.server_host,
+                            soft_timeout_seconds=600,
+                            stall_timeout_seconds=900,
+                            hard_timeout_seconds=max_hours * 3600 if max_hours else None,
+                            repair_scope=RepairScope.APPLICATION_FILES,
+                        )
+                    )
+                    # The remote current pointer is authoritative only when it still
+                    # names the process recorded for this database run.  A mismatch
+                    # falls back to the pre-managed compatibility path; it must never
+                    # attach an unrelated attempt merely because it shares a workdir.
+                    if recovered is not None and recovered.process_id == int(run.pid):
+                        managed_handle = recovered
             else:
                 managed_handle = await executor.launch_managed_run()
                 base_context = managed_handle.context
